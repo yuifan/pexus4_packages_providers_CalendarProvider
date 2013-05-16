@@ -16,28 +16,42 @@
 
 package com.android.providers.calendar;
 
-import android.database.sqlite.SQLiteOpenHelper;
-import com.android.common.ArrayListCursor;
-
-import android.content.*;
+import android.content.ComponentName;
+import android.content.ContentProvider;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.res.Resources;
 import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
 import android.net.Uri;
+import android.provider.CalendarContract;
+import android.provider.CalendarContract.Calendars;
+import android.provider.CalendarContract.Colors;
+import android.provider.CalendarContract.Events;
+import android.provider.CalendarContract.Instances;
+import android.test.AndroidTestCase;
+import android.test.IsolatedContext;
+import android.test.RenamingDelegatingContext;
+import android.test.mock.MockContentResolver;
+import android.test.mock.MockContext;
+import android.test.suitebuilder.annotation.SmallTest;
+import android.test.suitebuilder.annotation.Smoke;
+import android.test.suitebuilder.annotation.Suppress;
+import android.text.TextUtils;
 import android.text.format.DateUtils;
 import android.text.format.Time;
-import android.provider.Calendar;
-import android.provider.Calendar.Calendars;
-import android.provider.Calendar.Events;
-import android.provider.Calendar.EventsEntity;
-import android.provider.Calendar.Instances;
-import android.test.ProviderTestCase2;
-import android.test.mock.MockContentResolver;
-import android.test.suitebuilder.annotation.Suppress;
 import android.util.Log;
 
-import java.util.ArrayList;
+import java.io.File;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 
 /**
@@ -50,17 +64,36 @@ import java.util.TimeZone;
  * -w
  * -e class com.android.providers.calendar.CalendarProvider2Test
  * com.android.providers.calendar.tests/android.test.InstrumentationTestRunner
+ *
+ * This test no longer extends ProviderTestCase2 because it actually doesn't
+ * allow you to inject a custom context (which we needed to mock out the calls
+ * to start a service). We the next best thing, which is copy the relevant code
+ * from PTC2 and extend AndroidTestCase instead.
  */
 // flaky test, add back to LargeTest when fixed - bug 2395696
 // @LargeTest
-public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2ForTesting> {
+public class CalendarProvider2Test extends AndroidTestCase {
     static final String TAG = "calendar";
 
+    private static final String DEFAULT_ACCOUNT_TYPE = "com.google";
+    private static final String DEFAULT_ACCOUNT = "joe@joe.com";
+
+
+    private static final String WHERE_CALENDARS_SELECTED = Calendars.VISIBLE + "=?";
+    private static final String[] WHERE_CALENDARS_ARGS = {
+        "1"
+    };
+    private static final String WHERE_COLOR_ACCOUNT_AND_INDEX = Colors.ACCOUNT_NAME + "=? AND "
+            + Colors.ACCOUNT_TYPE + "=? AND " + Colors.COLOR_KEY + "=?";
+    private static final String DEFAULT_SORT_ORDER = "begin ASC";
+
+    private CalendarProvider2ForTesting mProvider;
     private SQLiteDatabase mDb;
     private MetaData mMetaData;
     private Context mContext;
     private MockContentResolver mResolver;
     private Uri mEventsUri = Events.CONTENT_URI;
+    private Uri mCalendarsUri = Calendars.CONTENT_URI;
     private int mCalendarId;
 
     protected boolean mWipe = false;
@@ -77,6 +110,43 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     private static final String DEFAULT_TIMEZONE = TIME_ZONE_AMERICA_LOS_ANGELES;
 
     private static final String MOCK_TIME_ZONE_DATABASE_VERSION = "2010a";
+
+    private static final long ONE_MINUTE_MILLIS = 60*1000;
+    private static final long ONE_HOUR_MILLIS = 3600*1000;
+    private static final long ONE_WEEK_MILLIS = 7 * 24 * 3600 * 1000;
+
+    /**
+     * We need a few more stub methods so that our tests can run
+     */
+    protected class MockContext2 extends MockContext {
+
+        @Override
+        public String getPackageName() {
+            return getContext().getPackageName();
+        }
+
+        @Override
+        public Resources getResources() {
+            return getContext().getResources();
+        }
+
+        @Override
+        public File getDir(String name, int mode) {
+            // name the directory so the directory will be seperated from
+            // one created through the regular Context
+            return getContext().getDir("mockcontext2_" + name, mode);
+        }
+
+        @Override
+        public ComponentName startService(Intent service) {
+            return null;
+        }
+
+        @Override
+        public boolean stopService(Intent service) {
+            return false;
+        }
+    }
 
     /**
      * KeyValue is a simple class that stores a pair of strings representing
@@ -125,16 +195,20 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
      */
     private class Delete implements Command {
         String eventName;
+        String account;
+        String accountType;
         int expected;
 
-        public Delete(String eventName, int expected) {
+        public Delete(String eventName, int expected, String account, String accountType) {
             this.eventName = eventName;
             this.expected = expected;
+            this.account = account;
+            this.accountType = accountType;
         }
 
         public void execute() {
             Log.i(TAG, "delete " + eventName);
-            int rows = deleteMatchingEvents(eventName);
+            int rows = deleteMatchingEvents(eventName, account, accountType);
             assertEquals(expected, rows);
         }
     }
@@ -165,14 +239,18 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             ContentValues map = new ContentValues();
             for (KeyValue pair : pairs) {
                 String value = pair.value;
-                if (Calendar.EventsColumns.STATUS.equals(pair.key)) {
+                if (CalendarContract.Events.STATUS.equals(pair.key)) {
                     // Do type conversion for STATUS
                     map.put(pair.key, Integer.parseInt(value));
                 } else {
                     map.put(pair.key, value);
                 }
             }
-            updateMatchingEvents(eventName, map);
+            if (map.size() == 1 && map.containsKey(Events.STATUS)) {
+                updateMatchingEventsStatusOnly(eventName, map);
+            } else {
+                updateMatchingEvents(eventName, map);
+            }
         }
     }
 
@@ -422,6 +500,9 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         String mOriginalTitle;
         long mOriginalInstance;
         int mSyncId;
+        String mCustomAppPackage;
+        String mCustomAppUri;
+        String mUid2445;
 
         // Constructor for normal events, using the default timezone
         public EventInfo(String title, String startDate, String endDate,
@@ -452,6 +533,9 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             mDuration = null;
             mRrule = null;
             mAllDay = allDay;
+            mCustomAppPackage = "CustomAppPackage-" + mTitle;
+            mCustomAppUri = "CustomAppUri-" + mTitle;
+            mUid2445 = null;
         }
 
         // Constructor for repeating events, using the default timezone
@@ -499,18 +583,24 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
 
         // Constructor for recurrence exceptions, using the default timezone
         public EventInfo(String originalTitle, String originalInstance, String title,
-                String description, String startDate, String endDate, boolean allDay) {
+                String description, String startDate, String endDate, boolean allDay,
+                String customPackageName, String customPackageUri, String mUid2445) {
             init(originalTitle, originalInstance,
-                    title, description, startDate, endDate, allDay, DEFAULT_TIMEZONE);
+                    title, description, startDate, endDate, allDay, DEFAULT_TIMEZONE,
+                    customPackageName, customPackageUri, mUid2445);
         }
 
         public void init(String originalTitle, String originalInstance,
                 String title, String description, String startDate, String endDate,
-                boolean allDay, String timezone) {
+                boolean allDay, String timezone, String customPackageName,
+                String customPackageUri, String uid2445) {
             mOriginalTitle = originalTitle;
             Time time = new Time(timezone);
             time.parse3339(originalInstance);
             mOriginalInstance = time.toMillis(false /* use isDst */);
+            mCustomAppPackage = customPackageName;
+            mCustomAppUri = customPackageUri;
+            mUid2445 = uid2445;
             init(title, description, startDate, endDate, null /* rrule */, allDay, timezone);
         }
     }
@@ -584,26 +674,31 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                     "FREQ=MONTHLY;WKST=SU;BYMONTHDAY=31", false),
             new EventInfo("daily0", "2008-05-01T00:00:00",
                     "except0", "daily0 exception for 5/1/2008 12am, change to 5/1/2008 2am to 3am",
-                    "2008-05-01T02:00:00", "2008-05-01T01:03:00", false),
+                    "2008-05-01T02:00:00", "2008-05-01T01:03:00", false, "AppPkg1", "AppUri1",
+                    "uid2445-1"),
             new EventInfo("daily0", "2008-05-03T00:00:00",
                     "except1", "daily0 exception for 5/3/2008 12am, change to 5/3/2008 2am to 3am",
-                    "2008-05-03T02:00:00", "2008-05-03T01:03:00", false),
+                    "2008-05-03T02:00:00", "2008-05-03T01:03:00", false, "AppPkg2", "AppUri2",
+                    null),
             new EventInfo("daily0", "2008-05-02T00:00:00",
                     "except2", "daily0 exception for 5/2/2008 12am, change to 1/2/2008",
-                    "2008-01-02T00:00:00", "2008-01-02T01:00:00", false),
+                    "2008-01-02T00:00:00", "2008-01-02T01:00:00", false, "AppPkg3", "AppUri3",
+                    "12345@uid2445"),
             new EventInfo("weekly0", "2008-05-13T13:00:00",
                     "except3", "daily0 exception for 5/11/2008 1pm, change to 12/11/2008 1pm",
-                    "2008-12-11T13:00:00", "2008-12-11T14:00:00", false),
+                    "2008-12-11T13:00:00", "2008-12-11T14:00:00", false, "AppPkg4", "AppUri4",
+                    null),
             new EventInfo("weekly0", "2008-05-13T13:00:00",
                     "cancel0", "weekly0 exception for 5/13/2008 1pm",
-                    "2008-05-13T13:00:00", "2008-05-13T14:00:00", false),
+                    "2008-05-13T13:00:00", "2008-05-13T14:00:00", false, "AppPkg5", "AppUri5",
+                    null),
             new EventInfo("yearly0", "yearly on 5/1/2008 from 1pm to 2pm",
                     "2008-05-01T13:00:00", "2008-05-01T14:00:00",
                     "FREQ=YEARLY;WKST=SU", false),
     };
 
     /**
-     * This table is used to create repeating events and then check that the
+     * This table is used to verify the events generated by mEvents.  It checks that the
      * number of instances within a given range matches the expected number
      * of instances.
      */
@@ -674,13 +769,13 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             new Insert("normal1"),
             new Insert("normal2"),
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-31T00:01:00", 3),
-            new Delete("normal1", 1),
+            new Delete("normal1", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(2),
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-31T00:01:00", 2),
-            new Delete("normal1", 0),
-            new Delete("normal2", 1),
+            new Delete("normal1", 0, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
+            new Delete("normal2", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(1),
-            new Delete("normal0", 1),
+            new Delete("normal0", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(0),
     };
 
@@ -694,11 +789,11 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-01T00:01:00", 0),
             new QueryNumInstances("2008-05-02T00:00:00", "2008-05-02T00:01:00", 2),
             new QueryNumInstances("2008-05-03T00:00:00", "2008-05-03T00:01:00", 1),
-            new Delete("allday0", 1),
+            new Delete("allday0", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(1),
             new QueryNumInstances("2008-05-02T00:00:00", "2008-05-02T00:01:00", 1),
             new QueryNumInstances("2008-05-03T00:00:00", "2008-05-03T00:01:00", 1),
-            new Delete("allday1", 1),
+            new Delete("allday1", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(0),
     };
 
@@ -712,11 +807,11 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-02T00:01:00", 3),
             new QueryNumInstances("2008-05-01T01:01:00", "2008-05-02T00:01:00", 2),
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-04T00:01:00", 6),
-            new Delete("daily1", 1),
+            new Delete("daily1", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(1),
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-02T00:01:00", 2),
             new QueryNumInstances("2008-05-01T00:00:00", "2008-05-04T00:01:00", 4),
-            new Delete("daily0", 1),
+            new Delete("daily0", 1, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
             new QueryNumEvents(0),
     };
 
@@ -746,8 +841,8 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                             "2008-05-20T13:00:00", }),
             new Insert("cancel0"),
             new Update("cancel0", new KeyValue[] {
-                    new KeyValue(Calendar.EventsColumns.STATUS,
-                            "" + Calendar.EventsColumns.STATUS_CANCELED),
+                    new KeyValue(CalendarContract.Events.STATUS,
+                        Integer.toString(CalendarContract.Events.STATUS_CANCELED)),
             }),
             new VerifyAllInstances("2008-05-01T00:00:00", "2008-05-22T00:01:00",
                     new String[] {"2008-05-06T13:00:00",
@@ -809,7 +904,8 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             // It would be nice for the provider to handle this automatically,
             // but for now simulate the server-side cancel.
             new Update("except1", new KeyValue[] {
-                    new KeyValue(Calendar.EventsColumns.STATUS, "" + Calendar.EventsColumns.STATUS_CANCELED),
+                new KeyValue(CalendarContract.Events.STATUS,
+                        Integer.toString(CalendarContract.Events.STATUS_CANCELED)),
             }),
             // Verify that the recurrence exception does not appear.
             new VerifyAllInstances("2008-05-01T00:00:00", "2008-05-04T00:01:00",
@@ -838,47 +934,92 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         return null;
     }
 
-    public CalendarProvider2Test() {
-        super(CalendarProvider2ForTesting.class, Calendar.AUTHORITY);
-    }
-
     @Override
     protected void setUp() throws Exception {
         super.setUp();
+        // This code here is the code that was originally in ProviderTestCase2
+        mResolver = new MockContentResolver();
 
-        mContext = getMockContext();
-        mResolver = getMockContentResolver();
+        final String filenamePrefix = "test.";
+        RenamingDelegatingContext targetContextWrapper = new RenamingDelegatingContext(
+                new MockContext2(), // The context that most methods are delegated to
+                getContext(), // The context that file methods are delegated to
+                filenamePrefix);
+        mContext = new IsolatedContext(mResolver, targetContextWrapper);
+
+        mProvider = new CalendarProvider2ForTesting();
+        mProvider.attachInfo(mContext, null);
+
+        mResolver.addProvider(CalendarContract.AUTHORITY, mProvider);
         mResolver.addProvider("subscribedfeeds", new MockProvider("subscribedfeeds"));
         mResolver.addProvider("sync", new MockProvider("sync"));
 
-        CalendarDatabaseHelper helper = (CalendarDatabaseHelper) getProvider().getDatabaseHelper();
-        mDb = helper.getWritableDatabase();
-        wipeData(mDb);
         mMetaData = getProvider().mMetaData;
         mForceDtend = false;
-        initCalendarCache();
-    }
 
-
-    public void wipeData(SQLiteDatabase db) {
-        db.execSQL("DELETE FROM Calendars;");
-        db.execSQL("DELETE FROM Events;");
-        db.execSQL("DELETE FROM EventsRawTimes;");
-        db.execSQL("DELETE FROM Instances;");
-        db.execSQL("DELETE FROM CalendarMetaData;");
-        db.execSQL("DELETE FROM CalendarCache;");
-        db.execSQL("DELETE FROM Attendees;");
-        db.execSQL("DELETE FROM Reminders;");
-        db.execSQL("DELETE FROM CalendarAlerts;");
-        db.execSQL("DELETE FROM ExtendedProperties;");
+        CalendarDatabaseHelper helper = (CalendarDatabaseHelper) getProvider().getDatabaseHelper();
+        mDb = helper.getWritableDatabase();
+        wipeAndInitData(helper, mDb);
     }
 
     @Override
     protected void tearDown() throws Exception {
-        mDb.close();
-        mDb = null;
-        getProvider().getDatabaseHelper().close();
+        try {
+            mDb.close();
+            mDb = null;
+            getProvider().getDatabaseHelper().close();
+        } catch (IllegalStateException e) {
+            e.printStackTrace();
+        }
         super.tearDown();
+    }
+
+    public void wipeAndInitData(SQLiteOpenHelper helper, SQLiteDatabase db)
+            throws CalendarCache.CacheException {
+        db.beginTransaction();
+
+        // Clean tables
+        db.delete("Calendars", null, null);
+        db.delete("Events", null, null);
+        db.delete("EventsRawTimes", null, null);
+        db.delete("Instances", null, null);
+        db.delete("CalendarMetaData", null, null);
+        db.delete("CalendarCache", null, null);
+        db.delete("Attendees", null, null);
+        db.delete("Reminders", null, null);
+        db.delete("CalendarAlerts", null, null);
+        db.delete("ExtendedProperties", null, null);
+
+        // Set CalendarCache data
+        initCalendarCacheLocked(helper, db);
+
+        // set CalendarMetaData data
+        long now = System.currentTimeMillis();
+        ContentValues values = new ContentValues();
+        values.put("localTimezone", "America/Los_Angeles");
+        values.put("minInstance", 1207008000000L); // 1st April 2008
+        values.put("maxInstance", now + ONE_WEEK_MILLIS);
+        db.insert("CalendarMetaData", null, values);
+
+        db.setTransactionSuccessful();
+        db.endTransaction();
+    }
+
+    private void initCalendarCacheLocked(SQLiteOpenHelper helper, SQLiteDatabase db)
+            throws CalendarCache.CacheException {
+        CalendarCache cache = new CalendarCache(helper);
+
+        String localTimezone = TimeZone.getDefault().getID();
+
+        // Set initial values
+        cache.writeDataLocked(db, CalendarCache.KEY_TIMEZONE_DATABASE_VERSION, "2010k");
+        cache.writeDataLocked(db, CalendarCache.KEY_TIMEZONE_TYPE, CalendarCache.TIMEZONE_TYPE_AUTO);
+        cache.writeDataLocked(db, CalendarCache.KEY_TIMEZONE_INSTANCES, localTimezone);
+        cache.writeDataLocked(db, CalendarCache.KEY_TIMEZONE_INSTANCES_PREVIOUS, localTimezone);
+    }
+
+    protected CalendarProvider2ForTesting getProvider() {
+        return mProvider;
     }
 
     /**
@@ -903,65 +1044,111 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     }
 
     private int insertCal(String name, String timezone) {
-        return insertCal(name, timezone, "joe@joe.com");
+        return insertCal(name, timezone, DEFAULT_ACCOUNT);
     }
 
+    /**
+     * Creates a new calendar, with the provided name, time zone, and account name.
+     *
+     * @return the new calendar's _ID value
+     */
     private int insertCal(String name, String timezone, String account) {
         ContentValues m = new ContentValues();
         m.put(Calendars.NAME, name);
-        m.put(Calendars.DISPLAY_NAME, name);
-        m.put(Calendars.COLOR, "0xff123456");
-        m.put(Calendars.TIMEZONE, timezone);
-        m.put(Calendars.SELECTED, 1);
-        m.put(Calendars.URL, CALENDAR_URL);
+        m.put(Calendars.CALENDAR_DISPLAY_NAME, name);
+        m.put(Calendars.CALENDAR_COLOR, 0xff123456);
+        m.put(Calendars.CALENDAR_TIME_ZONE, timezone);
+        m.put(Calendars.VISIBLE, 1);
+        m.put(Calendars.CAL_SYNC1, CALENDAR_URL);
         m.put(Calendars.OWNER_ACCOUNT, account);
-        m.put(Calendars._SYNC_ACCOUNT,  account);
-        m.put(Calendars._SYNC_ACCOUNT_TYPE,  "com.google");
+        m.put(Calendars.ACCOUNT_NAME,  account);
+        m.put(Calendars.ACCOUNT_TYPE, DEFAULT_ACCOUNT_TYPE);
         m.put(Calendars.SYNC_EVENTS,  1);
 
-        Uri url = mResolver.insert(Calendar.Calendars.CONTENT_URI, m);
+        Uri url = mResolver.insert(
+                addSyncQueryParams(mCalendarsUri, account, DEFAULT_ACCOUNT_TYPE), m);
         String id = url.getLastPathSegment();
         return Integer.parseInt(id);
     }
 
+    private String obsToString(Object... objs) {
+        StringBuilder bob = new StringBuilder();
+
+        for (Object obj : objs) {
+            bob.append(obj.toString());
+            bob.append('#');
+        }
+
+        return bob.toString();
+    }
+
+    private Uri insertColor(long colorType, String colorKey, long color) {
+        ContentValues m = new ContentValues();
+        m.put(Colors.ACCOUNT_NAME, DEFAULT_ACCOUNT);
+        m.put(Colors.ACCOUNT_TYPE, DEFAULT_ACCOUNT_TYPE);
+        m.put(Colors.DATA, obsToString(colorType, colorKey, color));
+        m.put(Colors.COLOR_TYPE, colorType);
+        m.put(Colors.COLOR_KEY, colorKey);
+        m.put(Colors.COLOR, color);
+
+        Uri uri = CalendarContract.Colors.CONTENT_URI;
+
+        return mResolver.insert(addSyncQueryParams(uri, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), m);
+    }
+
+    private void updateAndCheckColor(long colorId, long colorType, String colorKey, long color) {
+
+        Uri uri = CalendarContract.Colors.CONTENT_URI;
+
+        final String where = Colors.ACCOUNT_NAME + "=? AND " + Colors.ACCOUNT_TYPE + "=? AND "
+                + Colors.COLOR_TYPE + "=? AND " + Colors.COLOR_KEY + "=?";
+
+        String[] selectionArgs = new String[] {
+                DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE, Long.toString(colorType), colorKey
+        };
+
+        ContentValues cv = new ContentValues();
+        cv.put(Colors.COLOR, color);
+        cv.put(Colors.DATA, obsToString(colorType, colorKey, color));
+
+        int count = mResolver.update(
+                addSyncQueryParams(uri, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), cv, where,
+                selectionArgs);
+
+        checkColor(colorId, colorType, colorKey, color);
+
+        assertEquals(1, count);
+    }
+
+    /**
+     * Constructs a URI from a base URI (e.g. "content://com.android.calendar/calendars"),
+     * an account name, and an account type.
+     */
+    private Uri addSyncQueryParams(Uri uri, String account, String accountType) {
+        return uri.buildUpon().appendQueryParameter(CalendarContract.CALLER_IS_SYNCADAPTER, "true")
+                .appendQueryParameter(Calendars.ACCOUNT_NAME, account)
+                .appendQueryParameter(Calendars.ACCOUNT_TYPE, accountType).build();
+    }
+
+    private int deleteMatchingCalendars(String selection, String[] selectionArgs) {
+        return mResolver.delete(mCalendarsUri, selection, selectionArgs);
+    }
+
     private Uri insertEvent(int calId, EventInfo event) {
+        return insertEvent(calId, event, null);
+    }
+
+    private Uri insertEvent(int calId, EventInfo event, ContentValues cv) {
         if (mWipe) {
             // Wipe instance table so it will be regenerated
             mMetaData.clearInstanceRange();
         }
-        ContentValues m = new ContentValues();
-        m.put(Events.CALENDAR_ID, calId);
-        m.put(Events.TITLE, event.mTitle);
-        m.put(Events.DTSTART, event.mDtstart);
-        m.put(Events.ALL_DAY, event.mAllDay ? 1 : 0);
 
-        if (event.mRrule == null || mForceDtend) {
-            // This is a normal event
-            m.put(Events.DTEND, event.mDtend);
-        }
-        if (event.mRrule != null) {
-            // This is a repeating event
-            m.put(Events.RRULE, event.mRrule);
-            m.put(Events.DURATION, event.mDuration);
+        if (cv == null) {
+            cv = eventInfoToContentValues(calId, event);
         }
 
-        if (event.mDescription != null) {
-            m.put(Events.DESCRIPTION, event.mDescription);
-        }
-        if (event.mTimezone != null) {
-            m.put(Events.EVENT_TIMEZONE, event.mTimezone);
-        }
-
-        if (event.mOriginalTitle != null) {
-            // This is a recurrence exception.
-            EventInfo recur = findEvent(event.mOriginalTitle);
-            assertNotNull(recur);
-            String syncId = String.format("%d", recur.mSyncId);
-            m.put(Events.ORIGINAL_EVENT, syncId);
-            m.put(Events.ORIGINAL_ALL_DAY, recur.mAllDay ? 1 : 0);
-            m.put(Events.ORIGINAL_INSTANCE_TIME, event.mOriginalInstance);
-        }
-        Uri url = mResolver.insert(mEventsUri, m);
+        Uri url = mResolver.insert(mEventsUri, cv);
 
         // Create a fake _sync_id and add it to the event.  Update the database
         // directly so that we don't trigger any validation checks in the
@@ -974,12 +1161,59 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         return url;
     }
 
+    private ContentValues eventInfoToContentValues(int calId, EventInfo event) {
+        ContentValues m = new ContentValues();
+        m.put(Events.CALENDAR_ID, calId);
+        m.put(Events.TITLE, event.mTitle);
+        m.put(Events.DTSTART, event.mDtstart);
+        m.put(Events.ALL_DAY, event.mAllDay ? 1 : 0);
+
+        if (event.mRrule == null || mForceDtend) {
+            // This is a normal event
+            m.put(Events.DTEND, event.mDtend);
+            m.remove(Events.DURATION);
+        }
+        if (event.mRrule != null) {
+            // This is a repeating event
+            m.put(Events.RRULE, event.mRrule);
+            m.put(Events.DURATION, event.mDuration);
+            m.remove(Events.DTEND);
+        }
+
+        if (event.mDescription != null) {
+            m.put(Events.DESCRIPTION, event.mDescription);
+        }
+        if (event.mTimezone != null) {
+            m.put(Events.EVENT_TIMEZONE, event.mTimezone);
+        }
+        if (event.mCustomAppPackage != null) {
+            m.put(Events.CUSTOM_APP_PACKAGE, event.mCustomAppPackage);
+        }
+        if (event.mCustomAppUri != null) {
+            m.put(Events.CUSTOM_APP_URI, event.mCustomAppUri);
+        }
+        if (event.mUid2445 != null) {
+            m.put(Events.UID_2445, event.mUid2445);
+        }
+
+        if (event.mOriginalTitle != null) {
+            // This is a recurrence exception.
+            EventInfo recur = findEvent(event.mOriginalTitle);
+            assertNotNull(recur);
+            String syncId = String.format("%d", recur.mSyncId);
+            m.put(Events.ORIGINAL_SYNC_ID, syncId);
+            m.put(Events.ORIGINAL_ALL_DAY, recur.mAllDay ? 1 : 0);
+            m.put(Events.ORIGINAL_INSTANCE_TIME, event.mOriginalInstance);
+        }
+        return m;
+    }
+
     /**
      * Deletes all the events that match the given title.
      * @param title the given title to match events on
      * @return the number of rows deleted
      */
-    private int deleteMatchingEvents(String title) {
+    private int deleteMatchingEvents(String title, String account, String accountType) {
         Cursor cursor = mResolver.query(mEventsUri, new String[] { Events._ID },
                 "title=?", new String[] { title }, null);
         int numRows = 0;
@@ -987,7 +1221,8 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             long id = cursor.getLong(0);
             // Do delete as a sync adapter so event is really deleted, not just marked
             // as deleted.
-            Uri uri = updatedUri(ContentUris.withAppendedId(Events.CONTENT_URI, id), true);
+            Uri uri = updatedUri(ContentUris.withAppendedId(Events.CONTENT_URI, id), true, account,
+                    accountType);
             numRows += mResolver.delete(uri, null, null);
         }
         cursor.close();
@@ -1008,7 +1243,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                 Events.ALL_DAY,
                 Events.RRULE,
                 Events.EVENT_TIMEZONE,
-                Events.ORIGINAL_EVENT,
+                Events.ORIGINAL_SYNC_ID,
         };
         Cursor cursor = mResolver.query(mEventsUri, projection,
                 "title=?", new String[] { title }, null);
@@ -1022,7 +1257,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                     || values.containsKey(Events.DURATION) || values.containsKey(Events.ALL_DAY)
                     || values.containsKey(Events.RRULE)
                     || values.containsKey(Events.EVENT_TIMEZONE)
-                    || values.containsKey(Calendar.EventsColumns.STATUS)) {
+                    || values.containsKey(CalendarContract.Events.STATUS)) {
                 long dtstart = cursor.getLong(1);
                 long dtend = cursor.getLong(2);
                 String duration = cursor.getString(3);
@@ -1050,8 +1285,8 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                 if (!values.containsKey(Events.EVENT_TIMEZONE) && timezone != null) {
                     values.put(Events.EVENT_TIMEZONE, timezone);
                 }
-                if (!values.containsKey(Events.ORIGINAL_EVENT) && originalEvent != null) {
-                    values.put(Events.ORIGINAL_EVENT, originalEvent);
+                if (!values.containsKey(Events.ORIGINAL_SYNC_ID) && originalEvent != null) {
+                    values.put(Events.ORIGINAL_SYNC_ID, originalEvent);
                 }
             }
 
@@ -1062,50 +1297,196 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         return numRows;
     }
 
+    /**
+     * Updates the status of all the events that match the given title.
+     * @param title the given title to match events on
+     * @return the number of rows updated
+     */
+    private int updateMatchingEventsStatusOnly(String title, ContentValues values) {
+        String[] projection = new String[] {
+                Events._ID,
+        };
+        if (values.size() != 1 && !values.containsKey(Events.STATUS)) {
+            return 0;
+        }
+        Cursor cursor = mResolver.query(mEventsUri, projection,
+                "title=?", new String[] { title }, null);
+        int numRows = 0;
+        while (cursor.moveToNext()) {
+            long id = cursor.getLong(0);
+
+            Uri uri = ContentUris.withAppendedId(Events.CONTENT_URI, id);
+            numRows += mResolver.update(uri, values, null, null);
+        }
+        cursor.close();
+        return numRows;
+    }
+
+
     private void deleteAllEvents() {
         mDb.execSQL("DELETE FROM Events;");
         mMetaData.clearInstanceRange();
     }
 
-    private void initCalendarCache() throws CalendarCache.CacheException {
-        CalendarDatabaseHelper helper = (CalendarDatabaseHelper) getProvider().getDatabaseHelper();
-        cleanCalendarDataTable(helper);
-        CalendarCache cache = new CalendarCache(helper);
+    /**
+     * Creates an updated URI that includes query parameters that identify the source as a
+     * sync adapter.
+     */
+    static Uri asSyncAdapter(Uri uri, String account, String accountType) {
+        return uri.buildUpon()
+                .appendQueryParameter(android.provider.CalendarContract.CALLER_IS_SYNCADAPTER,
+                        "true")
+                .appendQueryParameter(Calendars.ACCOUNT_NAME, account)
+                .appendQueryParameter(Calendars.ACCOUNT_TYPE, accountType).build();
+    }
+    
+    public void testInsertUpdateDeleteColor() throws Exception {
+        // Calendar Color
+        long colorType = Colors.TYPE_CALENDAR;
+        String colorKey = "123";
+        long colorValue = 11;
+        long colorId = insertAndCheckColor(colorType, colorKey, colorValue);
 
-        String localTimezone = TimeZone.getDefault().getID();
+        try {
+            insertAndCheckColor(colorType, colorKey, colorValue);
+            fail("Expected to fail with duplicate insertion");
+        } catch (IllegalArgumentException iae) {
+            // good
+        }
 
-        // Set initial values
-        cache.writeTimezoneDatabaseVersion("2010k");
-        cache.writeTimezoneType(CalendarCache.TIMEZONE_TYPE_AUTO);
-        cache.writeTimezoneInstances(localTimezone);
-        cache.writeTimezoneInstancesPrevious(localTimezone);
+        // Test Update
+        colorValue += 11;
+        updateAndCheckColor(colorId, colorType, colorKey, colorValue);
+
+        // Event Color
+        colorType = Colors.TYPE_EVENT;
+        colorValue += 11;
+        colorId = insertAndCheckColor(colorType, colorKey, colorValue);
+        try {
+            insertAndCheckColor(colorType, colorKey, colorValue);
+            fail("Expected to fail with duplicate insertion");
+        } catch (IllegalArgumentException iae) {
+            // good
+        }
+
+        // Create an event with the old color value.
+        int calendarId0 = insertCal("Calendar0", DEFAULT_TIMEZONE);
+        String title = "colorTest";
+        ContentValues cv = this.eventInfoToContentValues(calendarId0, mEvents[0]);
+        cv.put(Events.EVENT_COLOR_KEY, colorKey);
+        cv.put(Events.TITLE, title);
+        Uri uri = insertEvent(calendarId0, mEvents[0], cv);
+        Cursor c = mResolver.query(uri, new String[] {Events.EVENT_COLOR},  null, null, null);
+        try {
+            // Confirm the color is set.
+            c.moveToFirst();
+            assertEquals(colorValue, c.getInt(0));
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+
+        // Test Update
+        colorValue += 11;
+        updateAndCheckColor(colorId, colorType, colorKey, colorValue);
+
+        // Check if color was updated in event.
+        c = mResolver.query(uri, new String[] {Events.EVENT_COLOR}, null, null, null);
+        try {
+            c.moveToFirst();
+            assertEquals(colorValue, c.getInt(0));
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+
+        // Test Delete
+        Uri colSyncUri = asSyncAdapter(Colors.CONTENT_URI, DEFAULT_ACCOUNT,
+                DEFAULT_ACCOUNT_TYPE);
+        try {
+            // Delete should fail if color referenced by an event.
+            mResolver.delete(colSyncUri, WHERE_COLOR_ACCOUNT_AND_INDEX,
+                    new String[] {DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE, colorKey});
+            fail("Should not allow deleting referenced color");
+        } catch (UnsupportedOperationException e) {
+            // Exception expected.
+        }
+        Cursor cursor = mResolver.query(Colors.CONTENT_URI, new String[] {Colors.COLOR_KEY},
+                Colors.COLOR_KEY + "=? AND " + Colors.COLOR_TYPE + "=?",
+                new String[] {colorKey, Long.toString(colorType)}, null);
+        assertEquals(1, cursor.getCount());
+
+        // Try again, by deleting the event, then the color.
+        assertEquals(1, deleteMatchingEvents(title, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE));
+        mResolver.delete(colSyncUri, WHERE_COLOR_ACCOUNT_AND_INDEX,
+                new String[] {DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE, colorKey});
+        cursor = mResolver.query(Colors.CONTENT_URI, new String[] {Colors.COLOR_KEY},
+                Colors.COLOR_KEY + "=? AND " + Colors.COLOR_TYPE + "=?",
+                new String[] {colorKey, Long.toString(colorType)}, null);
+        assertEquals(0, cursor.getCount());
+    }
+
+    private void checkColor(long colorId, long colorType, String colorKey, long color) {
+        String[] projection = new String[] {
+                Colors.ACCOUNT_NAME, // 0
+                Colors.ACCOUNT_TYPE, // 1
+                Colors.COLOR_TYPE,   // 2
+                Colors.COLOR_KEY,    // 3
+                Colors.COLOR,        // 4
+                Colors._ID,          // 5
+                Colors.DATA,         // 6
+        };
+        Cursor cursor = mResolver.query(Colors.CONTENT_URI, projection, Colors.COLOR_KEY
+                + "=? AND " + Colors.COLOR_TYPE + "=?", new String[] {
+                colorKey, Long.toString(colorType)
+        }, null /* sortOrder */);
+
+        assertEquals(1, cursor.getCount());
+
+        assertTrue(cursor.moveToFirst());
+        assertEquals(DEFAULT_ACCOUNT, cursor.getString(0));
+        assertEquals(DEFAULT_ACCOUNT_TYPE, cursor.getString(1));
+        assertEquals(colorType, cursor.getLong(2));
+        assertEquals(colorKey, cursor.getString(3));
+        assertEquals(color, cursor.getLong(4));
+        assertEquals(colorId, cursor.getLong(5));
+        assertEquals(obsToString(colorType, colorKey, color), cursor.getString(6));
+        cursor.close();
+    }
+
+    private long insertAndCheckColor(long colorType, String colorKey, long color) {
+        Uri uri = insertColor(colorType, colorKey, color);
+        long id = Long.parseLong(uri.getLastPathSegment());
+
+        checkColor(id, colorType, colorKey, color);
+        return id;
     }
 
     public void testInsertNormalEvents() throws Exception {
-        Cursor cursor;
-        Uri url = null;
-
-        int calId = insertCal("Calendar0", DEFAULT_TIMEZONE);
-
-        cursor = mResolver.query(mEventsUri, null, null, null, null);
+        final int calId = insertCal("Calendar0", DEFAULT_TIMEZONE);
+        Cursor cursor = mResolver.query(mEventsUri, null, null, null, null);
         assertEquals(0, cursor.getCount());
         cursor.close();
 
         // Keep track of the number of normal events
-        int numEvents = 0;
+        int numOfInserts = 0;
 
         // "begin" is the earliest start time of all the normal events,
         // and "end" is the latest end time of all the normal events.
         long begin = 0, end = 0;
 
         int len = mEvents.length;
+        Uri[] uris = new Uri[len];
+        ContentValues[] cvs = new ContentValues[len];
         for (int ii = 0; ii < len; ii++) {
             EventInfo event = mEvents[ii];
             // Skip repeating events and recurrence exceptions
             if (event.mRrule != null || event.mOriginalTitle != null) {
                 continue;
             }
-            if (numEvents == 0) {
+            if (numOfInserts == 0) {
                 begin = event.mDtstart;
                 end = event.mDtend;
             } else {
@@ -1116,24 +1497,31 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                     end = event.mDtend;
                 }
             }
-            url = insertEvent(calId, event);
-            numEvents += 1;
+
+            cvs[ii] = eventInfoToContentValues(calId, event);
+            uris[ii] = insertEvent(calId, event, cvs[ii]);
+            numOfInserts += 1;
         }
 
-        // query one
-        cursor = mResolver.query(url, null, null, null, null);
-        assertEquals(1, cursor.getCount());
-        cursor.close();
+        // Verify
+        for (int i = 0; i < len; i++) {
+            if (cvs[i] == null) continue;
+            assertNotNull(uris[i]);
+            cursor = mResolver.query(uris[i], null, null, null, null);
+            assertEquals("Item " + i + " not found", 1, cursor.getCount());
+            verifyContentValueAgainstCursor(cvs[i], cvs[i].keySet(), cursor);
+            cursor.close();
+        }
 
         // query all
         cursor = mResolver.query(mEventsUri, null, null, null, null);
-        assertEquals(numEvents, cursor.getCount());
+        assertEquals(numOfInserts, cursor.getCount());
         cursor.close();
 
         // Check that the Instances table has one instance of each of the
         // normal events.
         cursor = queryInstances(begin, end);
-        assertEquals(numEvents, cursor.getCount());
+        assertEquals(numOfInserts, cursor.getCount());
         cursor.close();
     }
 
@@ -1148,27 +1536,35 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         cursor.close();
 
         // Keep track of the number of repeating events
-        int numEvents = 0;
+        int numOfInserts = 0;
 
         int len = mEvents.length;
+        Uri[] uris = new Uri[len];
+        ContentValues[] cvs = new ContentValues[len];
         for (int ii = 0; ii < len; ii++) {
             EventInfo event = mEvents[ii];
             // Skip normal events
             if (event.mRrule == null) {
                 continue;
             }
-            url = insertEvent(calId, event);
-            numEvents += 1;
+            cvs[ii] = eventInfoToContentValues(calId, event);
+            uris[ii] = insertEvent(calId, event, cvs[ii]);
+            numOfInserts += 1;
         }
 
-        // query one
-        cursor = mResolver.query(url, null, null, null, null);
-        assertEquals(1, cursor.getCount());
-        cursor.close();
+        // Verify
+        for (int i = 0; i < len; i++) {
+            if (cvs[i] == null) continue;
+            assertNotNull(uris[i]);
+            cursor = mResolver.query(uris[i], null, null, null, null);
+            assertEquals("Item " + i + " not found", 1, cursor.getCount());
+            verifyContentValueAgainstCursor(cvs[i], cvs[i].keySet(), cursor);
+            cursor.close();
+        }
 
         // query all
         cursor = mResolver.query(mEventsUri, null, null, null, null);
-        assertEquals(numEvents, cursor.getCount());
+        assertEquals(numOfInserts, cursor.getCount());
         cursor.close();
     }
 
@@ -1204,95 +1600,322 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             assertEquals(instance.mExpectedOccurrences, cursor.getCount());
             cursor.close();
             // Delete as sync_adapter so event is really deleted.
-            int rows = mResolver.delete(updatedUri(url, true),
+            int rows = mResolver.delete(
+                    updatedUri(url, true, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
                     null /* selection */, null /* selection args */);
             assertEquals(1, rows);
         }
     }
 
-    public void testEntityQuery() throws Exception {
-        testInsertNormalEvents(); // To initialize
+    public static <T> void assertArrayEquals(T[] expected, T[] actual) {
+        if (!Arrays.equals(expected, actual)) {
+            fail("expected:<" + Arrays.toString(expected) +
+                "> but was:<" + Arrays.toString(actual) + ">");
+        }
+    }
 
-        ContentValues reminder = new ContentValues();
-        reminder.put(Calendar.Reminders.EVENT_ID, 1);
-        reminder.put(Calendar.Reminders.MINUTES, 10);
-        reminder.put(Calendar.Reminders.METHOD, Calendar.Reminders.METHOD_SMS);
-        mResolver.insert(Calendar.Reminders.CONTENT_URI, reminder);
-        reminder.put(Calendar.Reminders.MINUTES, 20);
-        mResolver.insert(Calendar.Reminders.CONTENT_URI, reminder);
+    @SmallTest @Smoke
+    public void testEscapeSearchToken() {
+        String token = "test";
+        String expected = "test";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
 
-        ContentValues extended = new ContentValues();
-        extended.put(Calendar.ExtendedProperties.NAME, "foo");
-        extended.put(Calendar.ExtendedProperties.VALUE, "bar");
-        extended.put(Calendar.ExtendedProperties.EVENT_ID, 2);
-        mResolver.insert(Calendar.ExtendedProperties.CONTENT_URI, extended);
-        extended.put(Calendar.ExtendedProperties.EVENT_ID, 1);
-        mResolver.insert(Calendar.ExtendedProperties.CONTENT_URI, extended);
-        extended.put(Calendar.ExtendedProperties.NAME, "foo2");
-        extended.put(Calendar.ExtendedProperties.VALUE, "bar2");
-        mResolver.insert(Calendar.ExtendedProperties.CONTENT_URI, extended);
+        token = "%";
+        expected = "#%";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
 
-        ContentValues attendee = new ContentValues();
-        attendee.put(Calendar.Attendees.ATTENDEE_NAME, "Joe");
-        attendee.put(Calendar.Attendees.ATTENDEE_EMAIL, "joe@joe.com");
-        attendee.put(Calendar.Attendees.ATTENDEE_STATUS,
-                Calendar.Attendees.ATTENDEE_STATUS_DECLINED);
-        attendee.put(Calendar.Attendees.ATTENDEE_TYPE, Calendar.Attendees.TYPE_REQUIRED);
-        attendee.put(Calendar.Attendees.ATTENDEE_RELATIONSHIP,
-                Calendar.Attendees.RELATIONSHIP_PERFORMER);
-        attendee.put(Calendar.Attendees.EVENT_ID, 3);
-        mResolver.insert(Calendar.Attendees.CONTENT_URI, attendee);
+        token = "_";
+        expected = "#_";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
 
-        EntityIterator ei = EventsEntity.newEntityIterator(
-                mResolver.query(EventsEntity.CONTENT_URI, null, null, null, null), mResolver);
-        int count = 0;
+        token = "#";
+        expected = "##";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
+
+        token = "##";
+        expected = "####";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
+
+        token = "%_#";
+        expected = "#%#_##";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
+
+        token = "blah%blah";
+        expected = "blah#%blah";
+        assertEquals(expected, mProvider.escapeSearchToken(token));
+    }
+
+    @SmallTest @Smoke
+    public void testTokenizeSearchQuery() {
+        String query = "";
+        String[] expectedTokens = new String[] {};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "a";
+        expectedTokens = new String[] {"a"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "word";
+        expectedTokens = new String[] {"word"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "two words";
+        expectedTokens = new String[] {"two", "words"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "test, punctuation.";
+        expectedTokens = new String[] {"test", "punctuation"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "\"test phrase\"";
+        expectedTokens = new String[] {"test phrase"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "unquoted \"this is quoted\"";
+        expectedTokens = new String[] {"unquoted", "this is quoted"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = " \"this is quoted\"  unquoted ";
+        expectedTokens = new String[] {"this is quoted", "unquoted"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "escap%e m_e";
+        expectedTokens = new String[] {"escap#%e", "m#_e"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "'a bunch' of malformed\" things";
+        expectedTokens = new String[] {"a", "bunch", "of", "malformed", "things"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+
+        query = "''''''....,.''trim punctuation";
+        expectedTokens = new String[] {"trim", "punctuation"};
+        assertArrayEquals(expectedTokens, mProvider.tokenizeSearchQuery(query));
+    }
+
+    @SmallTest @Smoke
+    public void testConstructSearchWhere() {
+        String[] tokens = new String[] {"red"};
+        String expected = "(title LIKE ? ESCAPE \"#\" OR "
+            + "description LIKE ? ESCAPE \"#\" OR "
+            + "eventLocation LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeEmail) LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeName) LIKE ? ESCAPE \"#\" )";
+        assertEquals(expected, mProvider.constructSearchWhere(tokens));
+
+        tokens = new String[] {};
+        expected = "";
+        assertEquals(expected, mProvider.constructSearchWhere(tokens));
+
+        tokens = new String[] {"red", "green"};
+        expected = "(title LIKE ? ESCAPE \"#\" OR "
+                + "description LIKE ? ESCAPE \"#\" OR "
+                + "eventLocation LIKE ? ESCAPE \"#\" OR "
+                + "group_concat(attendeeEmail) LIKE ? ESCAPE \"#\" OR "
+                + "group_concat(attendeeName) LIKE ? ESCAPE \"#\" ) AND "
+                + "(title LIKE ? ESCAPE \"#\" OR "
+                + "description LIKE ? ESCAPE \"#\" OR "
+                + "eventLocation LIKE ? ESCAPE \"#\" OR "
+                + "group_concat(attendeeEmail) LIKE ? ESCAPE \"#\" OR "
+                + "group_concat(attendeeName) LIKE ? ESCAPE \"#\" )";
+        assertEquals(expected, mProvider.constructSearchWhere(tokens));
+
+        tokens = new String[] {"red blue", "green"};
+        expected = "(title LIKE ? ESCAPE \"#\" OR "
+            + "description LIKE ? ESCAPE \"#\" OR "
+            + "eventLocation LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeEmail) LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeName) LIKE ? ESCAPE \"#\" ) AND "
+            + "(title LIKE ? ESCAPE \"#\" OR "
+            + "description LIKE ? ESCAPE \"#\" OR "
+            + "eventLocation LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeEmail) LIKE ? ESCAPE \"#\" OR "
+            + "group_concat(attendeeName) LIKE ? ESCAPE \"#\" )";
+        assertEquals(expected, mProvider.constructSearchWhere(tokens));
+    }
+
+    @SmallTest @Smoke
+    public void testConstructSearchArgs() {
+        long rangeBegin = 0;
+        long rangeEnd = 10;
+
+        String[] tokens = new String[] {"red"};
+        String[] expected = new String[] {"10", "0", "%red%", "%red%",
+                "%red%", "%red%", "%red%" };
+        assertArrayEquals(expected, mProvider.constructSearchArgs(tokens,
+                rangeBegin, rangeEnd));
+
+        tokens = new String[] {"red", "blue"};
+        expected = new String[] { "10", "0", "%red%", "%red%", "%red%",
+                "%red%", "%red%", "%blue%", "%blue%",
+                "%blue%", "%blue%","%blue%"};
+        assertArrayEquals(expected, mProvider.constructSearchArgs(tokens,
+                rangeBegin, rangeEnd));
+
+        tokens = new String[] {};
+        expected = new String[] {"10", "0" };
+        assertArrayEquals(expected, mProvider.constructSearchArgs(tokens,
+                rangeBegin, rangeEnd));
+    }
+
+    public void testInstanceSearchQuery() throws Exception {
+        final String[] PROJECTION = new String[] {
+                Instances.TITLE,                 // 0
+                Instances.EVENT_LOCATION,        // 1
+                Instances.ALL_DAY,               // 2
+                Instances.CALENDAR_COLOR,        // 3
+                Instances.EVENT_TIMEZONE,        // 4
+                Instances.EVENT_ID,              // 5
+                Instances.BEGIN,                 // 6
+                Instances.END,                   // 7
+                Instances._ID,                   // 8
+                Instances.START_DAY,             // 9
+                Instances.END_DAY,               // 10
+                Instances.START_MINUTE,          // 11
+                Instances.END_MINUTE,            // 12
+                Instances.HAS_ALARM,             // 13
+                Instances.RRULE,                 // 14
+                Instances.RDATE,                 // 15
+                Instances.SELF_ATTENDEE_STATUS,  // 16
+                Events.ORGANIZER,                // 17
+                Events.GUESTS_CAN_MODIFY,        // 18
+        };
+
+        String orderBy = CalendarProvider2.SORT_CALENDAR_VIEW;
+        String where = Instances.SELF_ATTENDEE_STATUS + "!=" +
+                CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED;
+
+        int calId = insertCal("Calendar0", DEFAULT_TIMEZONE);
+        final String START = "2008-05-01T00:00:00";
+        final String END = "2008-05-01T20:00:00";
+
+        EventInfo event1 = new EventInfo("search orange",
+                START,
+                END,
+                false /* allDay */,
+                DEFAULT_TIMEZONE);
+        event1.mDescription = "this is description1";
+
+        EventInfo event2 = new EventInfo("search purple",
+                START,
+                END,
+                false /* allDay */,
+                DEFAULT_TIMEZONE);
+        event2.mDescription = "lasers, out of nowhere";
+
+        EventInfo event3 = new EventInfo("",
+                START,
+                END,
+                false /* allDay */,
+                DEFAULT_TIMEZONE);
+        event3.mDescription = "kapow";
+
+        EventInfo[] events = { event1, event2, event3 };
+
+        insertEvent(calId, events[0]);
+        insertEvent(calId, events[1]);
+        insertEvent(calId, events[2]);
+
+        Time time = new Time(DEFAULT_TIMEZONE);
+        time.parse3339(START);
+        long startMs = time.toMillis(true /* ignoreDst */);
+        // Query starting from way in the past to one hour into the event.
+        // Query is more than 2 months so the range won't get extended by the provider.
+        Cursor cursor = null;
+
         try {
-            while (ei.hasNext()) {
-                Entity entity = ei.next();
-                ContentValues values = entity.getEntityValues();
-                assertEquals(CALENDAR_URL, values.getAsString(Calendars.URL));
-                ArrayList<Entity.NamedContentValues> subvalues = entity.getSubValues();
-                switch (values.getAsInteger("_id")) {
-                    case 1:
-                        assertEquals(5, subvalues.size()); // 2 x reminder, 3 x extended properties
-                        break;
-                    case 2:
-                        // Extended properties (contains originalTimezone)
-                        assertEquals(2, subvalues.size());
-                        ContentValues subContentValues = subvalues.get(1).values;
-                        String name = subContentValues.getAsString(
-                                Calendar.ExtendedProperties.NAME);
-                        String value = subContentValues.getAsString(
-                                Calendar.ExtendedProperties.VALUE);
-                        assertEquals("foo", name);
-                        assertEquals("bar", value);
-                        break;
-                    case 3:
-                        assertEquals(2, subvalues.size()); // Attendees
-                        break;
-                    default:
-                        assertEquals(1, subvalues.size());
-                        break;
-                }
-                count += 1;
-            }
-            assertEquals(5, count);
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "search", where, null, orderBy);
+            assertEquals(2, cursor.getCount());
         } finally {
-            ei.close();
+            if (cursor != null) {
+                cursor.close();
+            }
         }
 
-        ei = EventsEntity.newEntityIterator(
-                    mResolver.query(EventsEntity.CONTENT_URI, null, "_id = 3", null, null),
-                mResolver);
         try {
-            count = 0;
-            while (ei.hasNext()) {
-                Entity entity = ei.next();
-                count += 1;
-            }
-            assertEquals(1, count);
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "purple", where, null, orderBy);
+            assertEquals(1, cursor.getCount());
         } finally {
-            ei.close();
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "puurple", where, null, orderBy);
+            assertEquals(0, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "purple lasers", where, null, orderBy);
+            assertEquals(1, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "lasers kapow", where, null, orderBy);
+            assertEquals(0, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "\"search purple\"", where, null, orderBy);
+            assertEquals(1, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "\"purple search\"", where, null, orderBy);
+            assertEquals(0, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        try {
+            cursor = queryInstances(mResolver, PROJECTION,
+                    startMs - DateUtils.YEAR_IN_MILLIS,
+                    startMs + DateUtils.HOUR_IN_MILLIS,
+                    "%", where, null, orderBy);
+            assertEquals(0, cursor.getCount());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
         }
     }
 
@@ -1302,57 +1925,57 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         insertEvent(calendarId0, mEvents[0]);
         insertEvent(calendarId1, mEvents[1]);
         // Should have 2 calendars and 2 events
-        testQueryCount(Calendar.Calendars.CONTENT_URI, null /* where */, 2);
-        testQueryCount(Calendar.Events.CONTENT_URI, null /* where */, 2);
+        testQueryCount(CalendarContract.Calendars.CONTENT_URI, null /* where */, 2);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null /* where */, 2);
 
-        int deletes = mResolver.delete(Calendar.Calendars.CONTENT_URI,
+        int deletes = mResolver.delete(CalendarContract.Calendars.CONTENT_URI,
                 "ownerAccount='user2@google.com'", null /* selectionArgs */);
 
         assertEquals(1, deletes);
         // Should have 1 calendar and 1 event
-        testQueryCount(Calendar.Calendars.CONTENT_URI, null /* where */, 1);
-        testQueryCount(Calendar.Events.CONTENT_URI, null /* where */, 1);
+        testQueryCount(CalendarContract.Calendars.CONTENT_URI, null /* where */, 1);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null /* where */, 1);
 
-        deletes = mResolver.delete(Uri.withAppendedPath(Calendar.Calendars.CONTENT_URI,
+        deletes = mResolver.delete(Uri.withAppendedPath(CalendarContract.Calendars.CONTENT_URI,
                 String.valueOf(calendarId0)),
                 null /* selection*/ , null /* selectionArgs */);
 
         assertEquals(1, deletes);
         // Should have 0 calendars and 0 events
-        testQueryCount(Calendar.Calendars.CONTENT_URI, null /* where */, 0);
-        testQueryCount(Calendar.Events.CONTENT_URI, null /* where */, 0);
+        testQueryCount(CalendarContract.Calendars.CONTENT_URI, null /* where */, 0);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null /* where */, 0);
 
-        deletes = mResolver.delete(Calendar.Calendars.CONTENT_URI,
+        deletes = mResolver.delete(CalendarContract.Calendars.CONTENT_URI,
                 "ownerAccount=?", new String[] {"user2@google.com"} /* selectionArgs */);
 
         assertEquals(0, deletes);
     }
-
+    
     public void testCalendarAlerts() throws Exception {
         // This projection is from AlertActivity; want to make sure it works.
         String[] projection = new String[] {
-                Calendar.CalendarAlerts._ID,              // 0
-                Calendar.CalendarAlerts.TITLE,            // 1
-                Calendar.CalendarAlerts.EVENT_LOCATION,   // 2
-                Calendar.CalendarAlerts.ALL_DAY,          // 3
-                Calendar.CalendarAlerts.BEGIN,            // 4
-                Calendar.CalendarAlerts.END,              // 5
-                Calendar.CalendarAlerts.EVENT_ID,         // 6
-                Calendar.CalendarAlerts.COLOR,            // 7
-                Calendar.CalendarAlerts.RRULE,            // 8
-                Calendar.CalendarAlerts.HAS_ALARM,        // 9
-                Calendar.CalendarAlerts.STATE,            // 10
-                Calendar.CalendarAlerts.ALARM_TIME,       // 11
+                CalendarContract.CalendarAlerts._ID,              // 0
+                CalendarContract.CalendarAlerts.TITLE,            // 1
+                CalendarContract.CalendarAlerts.EVENT_LOCATION,   // 2
+                CalendarContract.CalendarAlerts.ALL_DAY,          // 3
+                CalendarContract.CalendarAlerts.BEGIN,            // 4
+                CalendarContract.CalendarAlerts.END,              // 5
+                CalendarContract.CalendarAlerts.EVENT_ID,         // 6
+                CalendarContract.CalendarAlerts.CALENDAR_COLOR,   // 7
+                CalendarContract.CalendarAlerts.RRULE,            // 8
+                CalendarContract.CalendarAlerts.HAS_ALARM,        // 9
+                CalendarContract.CalendarAlerts.STATE,            // 10
+                CalendarContract.CalendarAlerts.ALARM_TIME,       // 11
         };
         testInsertNormalEvents(); // To initialize
 
-        Uri alertUri = Calendar.CalendarAlerts.insert(mResolver, 1 /* eventId */,
+        Uri alertUri = CalendarContract.CalendarAlerts.insert(mResolver, 1 /* eventId */,
                 2 /* begin */, 3 /* end */, 4 /* alarmTime */, 5 /* minutes */);
-        Calendar.CalendarAlerts.insert(mResolver, 1 /* eventId */,
+        CalendarContract.CalendarAlerts.insert(mResolver, 1 /* eventId */,
                 2 /* begin */, 7 /* end */, 8 /* alarmTime */, 9 /* minutes */);
 
         // Regular query
-        Cursor cursor = mResolver.query(Calendar.CalendarAlerts.CONTENT_URI, projection,
+        Cursor cursor = mResolver.query(CalendarContract.CalendarAlerts.CONTENT_URI, projection,
                 null /* selection */, null /* selectionArgs */, null /* sortOrder */);
 
         assertEquals(2, cursor.getCount());
@@ -1366,93 +1989,163 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         cursor.close();
 
         // Grouped by event query
-        cursor = mResolver.query(Calendar.CalendarAlerts.CONTENT_URI_BY_INSTANCE, projection,
-                null /* selection */, null /* selectionArgs */, null /* sortOrder */);
+        cursor = mResolver.query(CalendarContract.CalendarAlerts.CONTENT_URI_BY_INSTANCE,
+                projection, null /* selection */, null /* selectionArgs */, null /* sortOrder */);
 
         assertEquals(1, cursor.getCount());
         cursor.close();
     }
+
+    void checkEvents(int count, SQLiteDatabase db) {
+        Cursor cursor = db.query("Events", null, null, null, null, null, null);
+        try {
+            assertEquals(count, cursor.getCount());
+        } finally {
+            cursor.close();
+        }
+    }
+
+    void checkEvents(int count, SQLiteDatabase db, String calendar) {
+        Cursor cursor = db.query("Events", null, Events.CALENDAR_ID + "=?", new String[] {calendar},
+                null, null, null);
+        try {
+            assertEquals(count, cursor.getCount());
+        } finally {
+            cursor.close();
+        }
+    }
+
+
+//    TODO Reenable this when we are ready to work on this
+//
+//    public void testToShowInsertIsSlowForRecurringEvents() throws Exception {
+//        mCalendarId = insertCal("CalendarTestToShowInsertIsSlowForRecurringEvents", DEFAULT_TIMEZONE);
+//        String calendarIdString = Integer.toString(mCalendarId);
+//        long testStart = System.currentTimeMillis();
+//
+//        final int testTrials = 100;
+//
+//        for (int i = 0; i < testTrials; i++) {
+//            checkEvents(i, mDb, calendarIdString);
+//            long insertStartTime = System.currentTimeMillis();
+//            Uri eventUri = insertEvent(mCalendarId, findEvent("daily0"));
+//            Log.e(TAG, i + ") insertion time " + (System.currentTimeMillis() - insertStartTime));
+//        }
+//        Log.e(TAG, " Avg insertion time = " + (System.currentTimeMillis() - testStart)/testTrials);
+//    }
 
     /**
      * Test attendee processing
      * @throws Exception
      */
     public void testAttendees() throws Exception {
-        mCalendarId = insertCal("Calendar0", DEFAULT_TIMEZONE);
-
-        Uri eventUri = insertEvent(mCalendarId, findEvent("daily0"));
+        mCalendarId = insertCal("CalendarTestAttendees", DEFAULT_TIMEZONE);
+        String calendarIdString = Integer.toString(mCalendarId);
+        checkEvents(0, mDb, calendarIdString);
+        Uri eventUri = insertEvent(mCalendarId, findEvent("normal0"));
+        checkEvents(1, mDb, calendarIdString);
         long eventId = ContentUris.parseId(eventUri);
 
         ContentValues attendee = new ContentValues();
-        attendee.put(Calendar.Attendees.ATTENDEE_NAME, "Joe");
-        attendee.put(Calendar.Attendees.ATTENDEE_EMAIL, "joe@joe.com");
-        attendee.put(Calendar.Attendees.ATTENDEE_TYPE, Calendar.Attendees.TYPE_REQUIRED);
-        attendee.put(Calendar.Attendees.ATTENDEE_RELATIONSHIP,
-                Calendar.Attendees.RELATIONSHIP_ORGANIZER);
-        attendee.put(Calendar.Attendees.EVENT_ID, eventId);
-        Uri attendeesUri = mResolver.insert(Calendar.Attendees.CONTENT_URI, attendee);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_NAME, "Joe");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_EMAIL, DEFAULT_ACCOUNT);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_TYPE,
+                CalendarContract.Attendees.TYPE_REQUIRED);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_RELATIONSHIP,
+                CalendarContract.Attendees.RELATIONSHIP_ORGANIZER);
+        attendee.put(CalendarContract.Attendees.EVENT_ID, eventId);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_IDENTITY, "ID1");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_ID_NAMESPACE, "IDNS1");
+        Uri attendeesUri = mResolver.insert(CalendarContract.Attendees.CONTENT_URI, attendee);
 
-        Cursor cursor = mResolver.query(Calendar.Attendees.CONTENT_URI, null,
+        Cursor cursor = mResolver.query(CalendarContract.Attendees.CONTENT_URI, null,
                 "event_id=" + eventId, null, null);
-        assertEquals("Created event is missing", 1, cursor.getCount());
+        assertEquals("Created event is missing - cannot find EventUri = " + eventUri, 1,
+                cursor.getCount());
+        Set<String> attendeeColumns = attendee.keySet();
+        verifyContentValueAgainstCursor(attendee, attendeeColumns, cursor);
         cursor.close();
 
         cursor = mResolver.query(eventUri, null, null, null, null);
-        assertEquals("Created event is missing", 1, cursor.getCount());
-        int selfColumn = cursor.getColumnIndex(Calendar.Events.SELF_ATTENDEE_STATUS);
+        // TODO figure out why this test fails. App works fine for this case.
+        assertEquals("Created event is missing - cannot find EventUri = " + eventUri, 1,
+                cursor.getCount());
+        int selfColumn = cursor.getColumnIndex(CalendarContract.Events.SELF_ATTENDEE_STATUS);
         cursor.moveToNext();
         long selfAttendeeStatus = cursor.getInt(selfColumn);
-        assertEquals(Calendar.Attendees.ATTENDEE_STATUS_ACCEPTED, selfAttendeeStatus);
+        assertEquals(CalendarContract.Attendees.ATTENDEE_STATUS_ACCEPTED, selfAttendeeStatus);
         cursor.close();
 
-        // Change status to declined
-        attendee.put(Calendar.Attendees.ATTENDEE_STATUS,
-                Calendar.Attendees.ATTENDEE_STATUS_DECLINED);
-        mResolver.update(attendeesUri, attendee, null, null);
+        // Update status to declined and change identity
+        ContentValues attendeeUpdate = new ContentValues();
+        attendeeUpdate.put(CalendarContract.Attendees.ATTENDEE_IDENTITY, "ID2");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_IDENTITY, "ID2");
+        attendeeUpdate.put(CalendarContract.Attendees.ATTENDEE_STATUS,
+                CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_STATUS,
+                CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED);
+        mResolver.update(attendeesUri, attendeeUpdate, null, null);
 
+        // Check in attendees table
+        cursor = mResolver.query(attendeesUri, null, null, null, null);
+        cursor.moveToNext();
+        verifyContentValueAgainstCursor(attendee, attendeeColumns, cursor);
+        cursor.close();
+
+        // Test that the self status in events table is updated
         cursor = mResolver.query(eventUri, null, null, null, null);
         cursor.moveToNext();
         selfAttendeeStatus = cursor.getInt(selfColumn);
-        assertEquals(Calendar.Attendees.ATTENDEE_STATUS_DECLINED, selfAttendeeStatus);
+        assertEquals(CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED, selfAttendeeStatus);
         cursor.close();
 
         // Add another attendee
-        attendee.put(Calendar.Attendees.ATTENDEE_NAME, "Dude");
-        attendee.put(Calendar.Attendees.ATTENDEE_EMAIL, "dude@dude.com");
-        attendee.put(Calendar.Attendees.ATTENDEE_STATUS,
-                Calendar.Attendees.ATTENDEE_STATUS_ACCEPTED);
-        mResolver.insert(Calendar.Attendees.CONTENT_URI, attendee);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_NAME, "Dude");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_EMAIL, "dude@dude.com");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_STATUS,
+                CalendarContract.Attendees.ATTENDEE_STATUS_ACCEPTED);
+        mResolver.insert(CalendarContract.Attendees.CONTENT_URI, attendee);
 
-        cursor = mResolver.query(Calendar.Attendees.CONTENT_URI, null,
-                "event_id=" + mCalendarId, null, null);
+        cursor = mResolver.query(CalendarContract.Attendees.CONTENT_URI, null,
+                "event_id=" + eventId, null, null);
         assertEquals(2, cursor.getCount());
         cursor.close();
 
         cursor = mResolver.query(eventUri, null, null, null, null);
         cursor.moveToNext();
         selfAttendeeStatus = cursor.getInt(selfColumn);
-        assertEquals(Calendar.Attendees.ATTENDEE_STATUS_DECLINED, selfAttendeeStatus);
+        assertEquals(CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED, selfAttendeeStatus);
         cursor.close();
     }
 
+    private void verifyContentValueAgainstCursor(ContentValues cv,
+            Set<String> keys, Cursor cursor) {
+        cursor.moveToFirst();
+        for (String key : keys) {
+            assertEquals(cv.get(key).toString(),
+                    cursor.getString(cursor.getColumnIndex(key)));
+        }
+        cursor.close();
+    }
 
     /**
-     * Test the event's _sync_dirty status and clear it.
+     * Test the event's dirty status and clear it.
+     *
      * @param eventId event to fetch.
-     * @param wanted the wanted _sync_dirty status
+     * @param wanted the wanted dirty status
      */
     private void testAndClearDirty(long eventId, int wanted) {
         Cursor cursor = mResolver.query(
-                ContentUris.withAppendedId(Calendar.Events.CONTENT_URI, eventId),
+                ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId),
                 null, null, null, null);
         try {
             assertEquals("Event count", 1, cursor.getCount());
             cursor.moveToNext();
-            int dirty = cursor.getInt(cursor.getColumnIndex(Calendar.Events._SYNC_DIRTY));
+            int dirty = cursor.getInt(cursor.getColumnIndex(CalendarContract.Events.DIRTY));
             assertEquals("dirty flag", wanted, dirty);
             if (dirty == 1) {
                 // Have to access database directly since provider will set dirty again.
-                mDb.execSQL("UPDATE Events SET _sync_dirty=0 WHERE _id=" + eventId);
+                mDb.execSQL("UPDATE Events SET " + Events.DIRTY + "=0 WHERE _id=" + eventId);
             }
         } finally {
             cursor.close();
@@ -1492,12 +2185,12 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     }
 
     /**
-     * Add CALLER_IS_SYNCADAPTER to URI if this is a sync adapter operation.
+     * Adds CALLER_IS_SYNCADAPTER to URI if this is a sync adapter operation.  Otherwise,
+     * returns the original URI.
      */
-    private Uri updatedUri(Uri uri, boolean syncAdapter) {
+    private Uri updatedUri(Uri uri, boolean syncAdapter, String account, String accountType) {
         if (syncAdapter) {
-            return uri.buildUpon().appendQueryParameter(Calendar.CALLER_IS_SYNCADAPTER, "true")
-                    .build();
+            return addSyncQueryParams(uri, account, accountType);
         } else {
             return uri;
         }
@@ -1510,126 +2203,161 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     private void internalTestDirty(boolean syncAdapter) throws Exception {
         mCalendarId = insertCal("Calendar0", DEFAULT_TIMEZONE);
 
-        Uri eventUri = insertEvent(mCalendarId, findEvent("daily0"));
+        long now = System.currentTimeMillis();
+        long begin = (now / 1000) * 1000;
+        long end = begin + ONE_HOUR_MILLIS;
+        Time time = new Time(DEFAULT_TIMEZONE);
+        time.set(begin);
+        String startDate = time.format3339(false);
+        time.set(end);
+        String endDate = time.format3339(false);
+
+        EventInfo eventInfo = new EventInfo("current", startDate, endDate, false);
+        Uri eventUri = insertEvent(mCalendarId, eventInfo);
 
         long eventId = ContentUris.parseId(eventUri);
         testAndClearDirty(eventId, 1);
 
         ContentValues attendee = new ContentValues();
-        attendee.put(Calendar.Attendees.ATTENDEE_NAME, "Joe");
-        attendee.put(Calendar.Attendees.ATTENDEE_EMAIL, "joe@joe.com");
-        attendee.put(Calendar.Attendees.ATTENDEE_TYPE, Calendar.Attendees.TYPE_REQUIRED);
-        attendee.put(Calendar.Attendees.ATTENDEE_RELATIONSHIP,
-                Calendar.Attendees.RELATIONSHIP_ORGANIZER);
-        attendee.put(Calendar.Attendees.EVENT_ID, eventId);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_NAME, "Joe");
+        attendee.put(CalendarContract.Attendees.ATTENDEE_EMAIL, DEFAULT_ACCOUNT);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_TYPE,
+                CalendarContract.Attendees.TYPE_REQUIRED);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_RELATIONSHIP,
+                CalendarContract.Attendees.RELATIONSHIP_ORGANIZER);
+        attendee.put(CalendarContract.Attendees.EVENT_ID, eventId);
 
         Uri attendeeUri = mResolver.insert(
-                updatedUri(Calendar.Attendees.CONTENT_URI, syncAdapter),
+                updatedUri(CalendarContract.Attendees.CONTENT_URI, syncAdapter, DEFAULT_ACCOUNT,
+                        DEFAULT_ACCOUNT_TYPE),
                 attendee);
         testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.Attendees.CONTENT_URI, "event_id=" + eventId, 1);
+        testQueryCount(CalendarContract.Attendees.CONTENT_URI, "event_id=" + eventId, 1);
 
         ContentValues reminder = new ContentValues();
-        reminder.put(Calendar.Reminders.MINUTES, 10);
-        reminder.put(Calendar.Reminders.METHOD, Calendar.Reminders.METHOD_EMAIL);
-        reminder.put(Calendar.Attendees.EVENT_ID, eventId);
+        reminder.put(CalendarContract.Reminders.MINUTES, 30);
+        reminder.put(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_EMAIL);
+        reminder.put(CalendarContract.Attendees.EVENT_ID, eventId);
 
         Uri reminderUri = mResolver.insert(
-                updatedUri(Calendar.Reminders.CONTENT_URI, syncAdapter), reminder);
+                updatedUri(CalendarContract.Reminders.CONTENT_URI, syncAdapter, DEFAULT_ACCOUNT,
+                        DEFAULT_ACCOUNT_TYPE), reminder);
         testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.Reminders.CONTENT_URI, "event_id=" + eventId, 1);
+        testQueryCount(CalendarContract.Reminders.CONTENT_URI, "event_id=" + eventId, 1);
+
+        long alarmTime = begin + 5 * ONE_MINUTE_MILLIS;
 
         ContentValues alert = new ContentValues();
-        alert.put(Calendar.CalendarAlerts.BEGIN, 10);
-        alert.put(Calendar.CalendarAlerts.END, 20);
-        alert.put(Calendar.CalendarAlerts.ALARM_TIME, 30);
-        alert.put(Calendar.CalendarAlerts.CREATION_TIME, 40);
-        alert.put(Calendar.CalendarAlerts.RECEIVED_TIME, 50);
-        alert.put(Calendar.CalendarAlerts.NOTIFY_TIME, 60);
-        alert.put(Calendar.CalendarAlerts.STATE, Calendar.CalendarAlerts.SCHEDULED);
-        alert.put(Calendar.CalendarAlerts.MINUTES, 30);
-        alert.put(Calendar.CalendarAlerts.EVENT_ID, eventId);
+        alert.put(CalendarContract.CalendarAlerts.BEGIN, begin);
+        alert.put(CalendarContract.CalendarAlerts.END, end);
+        alert.put(CalendarContract.CalendarAlerts.ALARM_TIME, alarmTime);
+        alert.put(CalendarContract.CalendarAlerts.CREATION_TIME, now);
+        alert.put(CalendarContract.CalendarAlerts.RECEIVED_TIME, now);
+        alert.put(CalendarContract.CalendarAlerts.NOTIFY_TIME, now);
+        alert.put(CalendarContract.CalendarAlerts.STATE,
+                CalendarContract.CalendarAlerts.STATE_SCHEDULED);
+        alert.put(CalendarContract.CalendarAlerts.MINUTES, 30);
+        alert.put(CalendarContract.CalendarAlerts.EVENT_ID, eventId);
 
         Uri alertUri = mResolver.insert(
-                updatedUri(Calendar.CalendarAlerts.CONTENT_URI, syncAdapter), alert);
+                updatedUri(CalendarContract.CalendarAlerts.CONTENT_URI, syncAdapter,
+                        DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), alert);
         // Alerts don't dirty the event
         testAndClearDirty(eventId, 0);
-        testQueryCount(Calendar.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 1);
+        testQueryCount(CalendarContract.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 1);
 
         ContentValues extended = new ContentValues();
-        extended.put(Calendar.ExtendedProperties.NAME, "foo");
-        extended.put(Calendar.ExtendedProperties.VALUE, "bar");
-        extended.put(Calendar.ExtendedProperties.EVENT_ID, eventId);
+        extended.put(CalendarContract.ExtendedProperties.NAME, "foo");
+        extended.put(CalendarContract.ExtendedProperties.VALUE, "bar");
+        extended.put(CalendarContract.ExtendedProperties.EVENT_ID, eventId);
 
-        Uri extendedUri = mResolver.insert(
-                updatedUri(Calendar.ExtendedProperties.CONTENT_URI, syncAdapter), extended);
-        testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.ExtendedProperties.CONTENT_URI, "event_id=" + eventId, 2);
+        Uri extendedUri = null;
+        if (syncAdapter) {
+            // Only the sync adapter is allowed to modify ExtendedProperties.
+            extendedUri = mResolver.insert(
+                    updatedUri(CalendarContract.ExtendedProperties.CONTENT_URI, syncAdapter,
+                            DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), extended);
+            testAndClearDirty(eventId, syncAdapter ? 0 : 1);
+            testQueryCount(CalendarContract.ExtendedProperties.CONTENT_URI,
+                    "event_id=" + eventId, 2);
+        } else {
+            // Confirm that inserting as app fails.
+            try {
+                extendedUri = mResolver.insert(
+                        updatedUri(CalendarContract.ExtendedProperties.CONTENT_URI, syncAdapter,
+                                DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), extended);
+                fail("Only sync adapter should be allowed to insert into ExtendedProperties");
+            } catch (IllegalArgumentException iae) {}
+        }
 
         // Now test updates
 
         attendee = new ContentValues();
-        attendee.put(Calendar.Attendees.ATTENDEE_NAME, "Sam");
-        // Need to include EVENT_ID with attendee update.  Is that desired?
-        attendee.put(Calendar.Attendees.EVENT_ID, eventId);
+        attendee.put(CalendarContract.Attendees.ATTENDEE_NAME, "Sam");
 
-        assertEquals("update", 1, mResolver.update(updatedUri(attendeeUri, syncAdapter), attendee,
+        assertEquals("update", 1, mResolver.update(
+                updatedUri(attendeeUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
+                attendee,
                 null /* where */, null /* selectionArgs */));
         testAndClearDirty(eventId, syncAdapter ? 0 : 1);
 
-        testQueryCount(Calendar.Attendees.CONTENT_URI, "event_id=" + eventId, 1);
-
-        reminder = new ContentValues();
-        reminder.put(Calendar.Reminders.MINUTES, 20);
-
-        assertEquals("update", 1, mResolver.update(updatedUri(reminderUri, syncAdapter), reminder,
-                null /* where */, null /* selectionArgs */));
-        testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.Reminders.CONTENT_URI, "event_id=" + eventId, 1);
+        testQueryCount(CalendarContract.Attendees.CONTENT_URI, "event_id=" + eventId, 1);
 
         alert = new ContentValues();
-        alert.put(Calendar.CalendarAlerts.STATE, Calendar.CalendarAlerts.DISMISSED);
+        alert.put(CalendarContract.CalendarAlerts.STATE,
+                CalendarContract.CalendarAlerts.STATE_DISMISSED);
 
-        assertEquals("update", 1, mResolver.update(updatedUri(alertUri, syncAdapter), alert,
+        assertEquals("update", 1, mResolver.update(
+                updatedUri(alertUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE), alert,
                 null /* where */, null /* selectionArgs */));
         // Alerts don't dirty the event
         testAndClearDirty(eventId, 0);
-        testQueryCount(Calendar.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 1);
+        testQueryCount(CalendarContract.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 1);
 
         extended = new ContentValues();
-        extended.put(Calendar.ExtendedProperties.VALUE, "baz");
+        extended.put(CalendarContract.ExtendedProperties.VALUE, "baz");
 
-        assertEquals("update", 1, mResolver.update(updatedUri(extendedUri, syncAdapter), extended,
-                null /* where */, null /* selectionArgs */));
-        testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.ExtendedProperties.CONTENT_URI, "event_id=" + eventId, 2);
+        if (syncAdapter) {
+            assertEquals("update", 1, mResolver.update(
+                    updatedUri(extendedUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
+                    extended,
+                    null /* where */, null /* selectionArgs */));
+            testAndClearDirty(eventId, syncAdapter ? 0 : 1);
+            testQueryCount(CalendarContract.ExtendedProperties.CONTENT_URI,
+                    "event_id=" + eventId, 2);
+        }
 
         // Now test deletes
 
         assertEquals("delete", 1, mResolver.delete(
-                updatedUri(attendeeUri, syncAdapter),
+                updatedUri(attendeeUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
                 null, null /* selectionArgs */));
         testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.Attendees.CONTENT_URI, "event_id=" + eventId, 0);
+        testQueryCount(CalendarContract.Attendees.CONTENT_URI, "event_id=" + eventId, 0);
 
-        assertEquals("delete", 1, mResolver.delete(updatedUri(reminderUri, syncAdapter),
+        assertEquals("delete", 1, mResolver.delete(
+                updatedUri(reminderUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
                 null /* where */, null /* selectionArgs */));
 
         testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.Reminders.CONTENT_URI, "event_id=" + eventId, 0);
+        testQueryCount(CalendarContract.Reminders.CONTENT_URI, "event_id=" + eventId, 0);
 
-        assertEquals("delete", 1, mResolver.delete(updatedUri(alertUri, syncAdapter),
+        assertEquals("delete", 1, mResolver.delete(
+                updatedUri(alertUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
                 null /* where */, null /* selectionArgs */));
 
         // Alerts don't dirty the event
         testAndClearDirty(eventId, 0);
-        testQueryCount(Calendar.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 0);
+        testQueryCount(CalendarContract.CalendarAlerts.CONTENT_URI, "event_id=" + eventId, 0);
 
-        assertEquals("delete", 1, mResolver.delete(updatedUri(extendedUri, syncAdapter),
-                null /* where */, null /* selectionArgs */));
+        if (syncAdapter) {
+            assertEquals("delete", 1, mResolver.delete(
+                    updatedUri(extendedUri, syncAdapter, DEFAULT_ACCOUNT, DEFAULT_ACCOUNT_TYPE),
+                    null /* where */, null /* selectionArgs */));
 
-        testAndClearDirty(eventId, syncAdapter ? 0 : 1);
-        testQueryCount(Calendar.ExtendedProperties.CONTENT_URI, "event_id=" + eventId, 1);
+            testAndClearDirty(eventId, syncAdapter ? 0 : 1);
+            testQueryCount(CalendarContract.ExtendedProperties.CONTENT_URI, "event_id=" + eventId, 1);
+        }
     }
 
     /**
@@ -1645,14 +2373,14 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         long eventId1 = ContentUris.parseId(eventUri);
         assertEquals("delete", 1, mResolver.delete(eventUri1, null, null));
         // Calendar has one event and one deleted event
-        testQueryCount(Calendar.Events.CONTENT_URI, null, 2);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null, 2);
 
-        assertEquals("delete", 1, mResolver.delete(Calendar.Calendars.CONTENT_URI,
+        assertEquals("delete", 1, mResolver.delete(CalendarContract.Calendars.CONTENT_URI,
                 "_id=" + mCalendarId, null));
         // Calendar should be deleted
-        testQueryCount(Calendar.Calendars.CONTENT_URI, null, 0);
+        testQueryCount(CalendarContract.Calendars.CONTENT_URI, null, 0);
         // Event should be gone
-        testQueryCount(Calendar.Events.CONTENT_URI, null, 0);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null, 0);
     }
 
     /**
@@ -1664,10 +2392,11 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         Uri eventUri0 = insertEvent(mCalendarId, findEvent("daily0"));
         Uri eventUri1 = insertEvent(calendarId1, findEvent("daily1"));
 
-        testQueryCount(Calendar.Events.CONTENT_URI, null, 2);
-        Uri eventsWithAccount = Calendar.Events.CONTENT_URI.buildUpon()
-                .appendQueryParameter(Calendar.EventsEntity.ACCOUNT_NAME, "joe@joe.com")
-                .appendQueryParameter(Calendar.EventsEntity.ACCOUNT_TYPE, "com.google")
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null, 2);
+        Uri eventsWithAccount = CalendarContract.Events.CONTENT_URI.buildUpon()
+                .appendQueryParameter(CalendarContract.EventsEntity.ACCOUNT_NAME, DEFAULT_ACCOUNT)
+                .appendQueryParameter(CalendarContract.EventsEntity.ACCOUNT_TYPE,
+                        DEFAULT_ACCOUNT_TYPE)
                 .build();
         // Only one event for that account
         testQueryCount(eventsWithAccount, null, 1);
@@ -1677,14 +2406,16 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         long eventId = ContentUris.parseId(eventUri1);
         // Wrong account, should not be deleted
         assertEquals("delete", 0, mResolver.delete(
-                updatedUri(eventsWithAccount, true /* syncAdapter */),
+                updatedUri(eventsWithAccount, true /* syncAdapter */, DEFAULT_ACCOUNT,
+                        DEFAULT_ACCOUNT_TYPE),
                 "_id=" + eventId, null /* selectionArgs */));
-        testQueryCount(Calendar.Events.CONTENT_URI, null, 2);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null, 2);
         // Right account, should be deleted
         assertEquals("delete", 1, mResolver.delete(
-                updatedUri(Calendar.Events.CONTENT_URI, true /* syncAdapter */),
+                updatedUri(CalendarContract.Events.CONTENT_URI, true /* syncAdapter */,
+                        "user2@google.com", DEFAULT_ACCOUNT_TYPE),
                 "_id=" + eventId, null /* selectionArgs */));
-        testQueryCount(Calendar.Events.CONTENT_URI, null, 1);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null, 1);
     }
 
     /**
@@ -1801,7 +2532,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
 
     /**
      * Test the query done by Event.loadEvents
-     * Also test that instance queries work when an even straddles the expansion range
+     * Also test that instance queries work when an event straddles the expansion range
      * @throws Exception
      */
     public void testInstanceQuery() throws Exception {
@@ -1809,7 +2540,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                 Instances.TITLE,                 // 0
                 Instances.EVENT_LOCATION,        // 1
                 Instances.ALL_DAY,               // 2
-                Instances.COLOR,                 // 3
+                Instances.CALENDAR_COLOR,        // 3
                 Instances.EVENT_TIMEZONE,        // 4
                 Instances.EVENT_ID,              // 5
                 Instances.BEGIN,                 // 6
@@ -1827,8 +2558,9 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
                 Events.GUESTS_CAN_MODIFY,        // 18
         };
 
-        String orderBy = Instances.SORT_CALENDAR_VIEW;
-        String where = Instances.SELF_ATTENDEE_STATUS + "!=" + Calendar.Attendees.ATTENDEE_STATUS_DECLINED;
+        String orderBy = CalendarProvider2.SORT_CALENDAR_VIEW;
+        String where = Instances.SELF_ATTENDEE_STATUS + "!="
+                + CalendarContract.Attendees.ATTENDEE_STATUS_DECLINED;
 
         int calId = insertCal("Calendar0", DEFAULT_TIMEZONE);
         final String START = "2008-05-01T00:00:00";
@@ -1847,9 +2579,9 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         long startMs = time.toMillis(true /* ignoreDst */);
         // Query starting from way in the past to one hour into the event.
         // Query is more than 2 months so the range won't get extended by the provider.
-        Cursor cursor = Instances.query(mResolver, PROJECTION,
+        Cursor cursor = queryInstances(mResolver, PROJECTION,
                 startMs - DateUtils.YEAR_IN_MILLIS, startMs + DateUtils.HOUR_IN_MILLIS,
-                where, orderBy);
+                where, null, orderBy);
         try {
             assertEquals(1, cursor.getCount());
         } finally {
@@ -1857,9 +2589,9 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         }
 
         // Now expand the instance range.  The event overlaps the new part of the range.
-        cursor = Instances.query(mResolver, PROJECTION,
+        cursor = queryInstances(mResolver, PROJECTION,
                 startMs - DateUtils.YEAR_IN_MILLIS, startMs + 2 * DateUtils.HOUR_IN_MILLIS,
-                where, orderBy);
+                where, null, orderBy);
         try {
             assertEquals(1, cursor.getCount());
         } finally {
@@ -1867,8 +2599,89 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         }
     }
 
+    /**
+     * Performs a query to return all visible instances in the given range that
+     * match the given selection. This is a blocking function and should not be
+     * done on the UI thread. This will cause an expansion of recurring events
+     * to fill this time range if they are not already expanded and will slow
+     * down for larger time ranges with many recurring events.
+     *
+     * @param cr The ContentResolver to use for the query
+     * @param projection The columns to return
+     * @param begin The start of the time range to query in UTC millis since
+     *            epoch
+     * @param end The end of the time range to query in UTC millis since epoch
+     * @param selection Filter on the query as an SQL WHERE statement
+     * @param selectionArgs Args to replace any '?'s in the selection
+     * @param orderBy How to order the rows as an SQL ORDER BY statement
+     * @return A Cursor of instances matching the selection
+     */
+    private static final Cursor queryInstances(ContentResolver cr, String[] projection, long begin,
+            long end, String selection, String[] selectionArgs, String orderBy) {
+
+        Uri.Builder builder = Instances.CONTENT_URI.buildUpon();
+        ContentUris.appendId(builder, begin);
+        ContentUris.appendId(builder, end);
+        if (TextUtils.isEmpty(selection)) {
+            selection = WHERE_CALENDARS_SELECTED;
+            selectionArgs = WHERE_CALENDARS_ARGS;
+        } else {
+            selection = "(" + selection + ") AND " + WHERE_CALENDARS_SELECTED;
+            if (selectionArgs != null && selectionArgs.length > 0) {
+                selectionArgs = Arrays.copyOf(selectionArgs, selectionArgs.length + 1);
+                selectionArgs[selectionArgs.length - 1] = WHERE_CALENDARS_ARGS[0];
+            } else {
+                selectionArgs = WHERE_CALENDARS_ARGS;
+            }
+        }
+        return cr.query(builder.build(), projection, selection, selectionArgs,
+                orderBy == null ? DEFAULT_SORT_ORDER : orderBy);
+    }
+
+    /**
+     * Performs a query to return all visible instances in the given range that
+     * match the given selection. This is a blocking function and should not be
+     * done on the UI thread. This will cause an expansion of recurring events
+     * to fill this time range if they are not already expanded and will slow
+     * down for larger time ranges with many recurring events.
+     *
+     * @param cr The ContentResolver to use for the query
+     * @param projection The columns to return
+     * @param begin The start of the time range to query in UTC millis since
+     *            epoch
+     * @param end The end of the time range to query in UTC millis since epoch
+     * @param searchQuery A string of space separated search terms. Segments
+     *            enclosed by double quotes will be treated as a single term.
+     * @param selection Filter on the query as an SQL WHERE statement
+     * @param selectionArgs Args to replace any '?'s in the selection
+     * @param orderBy How to order the rows as an SQL ORDER BY statement
+     * @return A Cursor of instances matching the selection
+     */
+    public static final Cursor queryInstances(ContentResolver cr, String[] projection, long begin,
+            long end, String searchQuery, String selection, String[] selectionArgs, String orderBy)
+            {
+        Uri.Builder builder = Instances.CONTENT_SEARCH_URI.buildUpon();
+        ContentUris.appendId(builder, begin);
+        ContentUris.appendId(builder, end);
+        builder = builder.appendPath(searchQuery);
+        if (TextUtils.isEmpty(selection)) {
+            selection = WHERE_CALENDARS_SELECTED;
+            selectionArgs = WHERE_CALENDARS_ARGS;
+        } else {
+            selection = "(" + selection + ") AND " + WHERE_CALENDARS_SELECTED;
+            if (selectionArgs != null && selectionArgs.length > 0) {
+                selectionArgs = Arrays.copyOf(selectionArgs, selectionArgs.length + 1);
+                selectionArgs[selectionArgs.length - 1] = WHERE_CALENDARS_ARGS[0];
+            } else {
+                selectionArgs = WHERE_CALENDARS_ARGS;
+            }
+        }
+        return cr.query(builder.build(), projection, selection, selectionArgs,
+                orderBy == null ? DEFAULT_SORT_ORDER : orderBy);
+    }
+
     private Cursor queryInstances(long begin, long end) {
-        Uri url = Uri.withAppendedPath(Calendar.Instances.CONTENT_URI, begin + "/" + end);
+        Uri url = Uri.withAppendedPath(CalendarContract.Instances.CONTENT_URI, begin + "/" + end);
         return mResolver.query(url, null, null, null, null);
     }
 
@@ -1890,7 +2703,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         @Override
         public Cursor query(Uri uri, String[] projection, String selection,
                 String[] selectionArgs, String sortOrder) {
-            return new ArrayListCursor(new String[]{}, new ArrayList<ArrayList>());
+            return new MatrixCursor(new String[]{ "_id" }, 0);
         }
 
         @Override
@@ -1947,16 +2760,16 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     }
 
     private void checkEvent(int eventId, String title, long dtStart, long dtEnd, boolean allDay) {
-        Uri uri = Uri.parse("content://" + Calendar.AUTHORITY + "/events");
+        Uri uri = Uri.parse("content://" + CalendarContract.AUTHORITY + "/events");
         Log.i(TAG, "Looking for EventId = " + eventId);
 
         Cursor cursor = mResolver.query(uri, null, null, null, null);
         assertEquals(1, cursor.getCount());
 
-        int colIndexTitle = cursor.getColumnIndex(Calendar.Events.TITLE);
-        int colIndexDtStart = cursor.getColumnIndex(Calendar.Events.DTSTART);
-        int colIndexDtEnd = cursor.getColumnIndex(Calendar.Events.DTEND);
-        int colIndexAllDay = cursor.getColumnIndex(Calendar.Events.ALL_DAY);
+        int colIndexTitle = cursor.getColumnIndex(CalendarContract.Events.TITLE);
+        int colIndexDtStart = cursor.getColumnIndex(CalendarContract.Events.DTSTART);
+        int colIndexDtEnd = cursor.getColumnIndex(CalendarContract.Events.DTEND);
+        int colIndexAllDay = cursor.getColumnIndex(CalendarContract.Events.ALL_DAY);
         if (!cursor.moveToNext()) {
             Log.e(TAG,"Could not find inserted event");
             assertTrue(false);
@@ -1968,10 +2781,11 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         cursor.close();
     }
 
-    public void testChangeTimezoneDB() throws CalendarCache.CacheException {
+    public void testChangeTimezoneDB() {
         int calId = insertCal("Calendar0", DEFAULT_TIMEZONE);
 
-        Cursor cursor = mResolver.query(Calendar.Events.CONTENT_URI, null, null, null, null);
+        Cursor cursor = mResolver
+                .query(CalendarContract.Events.CONTENT_URI, null, null, null, null);
         assertEquals(0, cursor.getCount());
         cursor.close();
 
@@ -1999,7 +2813,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
     }
 
     public static final Uri PROPERTIES_CONTENT_URI =
-            Uri.parse("content://" + Calendar.AUTHORITY + "/properties");
+            Uri.parse("content://" + CalendarContract.AUTHORITY + "/properties");
 
     public static final int COLUMN_KEY_INDEX = 1;
     public static final int COLUMN_VALUE_INDEX = 0;
@@ -2134,11 +2948,11 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         checkEvent(1, events[0].mTitle, events[0].mDtstart, events[0].mDtend, events[0].mAllDay);
 
         // Should have 1 calendars and 1 event
-        testQueryCount(Calendar.Calendars.CONTENT_URI, null /* where */, 1);
-        testQueryCount(Calendar.Events.CONTENT_URI, null /* where */, 1);
+        testQueryCount(CalendarContract.Calendars.CONTENT_URI, null /* where */, 1);
+        testQueryCount(CalendarContract.Events.CONTENT_URI, null /* where */, 1);
 
         // Verify that the original timezone is correct
-        Cursor cursor = mResolver.query(Calendar.ExtendedProperties.CONTENT_URI,
+        Cursor cursor = mResolver.query(CalendarContract.ExtendedProperties.CONTENT_URI,
                 null/* projection */,
                 "event_id=" + eventId,
                 null /* selectionArgs */,
@@ -2148,7 +2962,7 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
             assertEquals(1, cursor.getCount());
 
             if (cursor.moveToFirst()) {
-                long id = cursor.getLong(0);
+                long id = cursor.getLong(1);
                 assertEquals(id, eventId);
 
                 assertEquals(CalendarProvider2.EXT_PROP_ORIGINAL_TIMEZONE, cursor.getString(2));
@@ -2157,5 +2971,94 @@ public class CalendarProvider2Test extends ProviderTestCase2<CalendarProvider2Fo
         } finally {
             cursor.close();
         }
+    }
+
+    /**
+     * Verifies that the number of defined calendars meets expectations.
+     *
+     * @param expectedCount The number of calendars we expect to find.
+     */
+    private void checkCalendarCount(int expectedCount) {
+        Cursor cursor = mResolver.query(mCalendarsUri,
+                null /* projection */,
+                null /* selection */,
+                null /* selectionArgs */,
+                null /* sortOrder */);
+        assertEquals(expectedCount, cursor.getCount());
+        cursor.close();
+    }
+
+    private void checkCalendarExists(int calId) {
+        assertTrue(isCalendarExists(calId));
+    }
+
+    private void checkCalendarDoesNotExists(int calId) {
+        assertFalse(isCalendarExists(calId));
+    }
+
+    private boolean isCalendarExists(int calId) {
+        Cursor cursor = mResolver.query(mCalendarsUri,
+                new String[] {Calendars._ID},
+                null /* selection */,
+                null /* selectionArgs */,
+                null /* sortOrder */);
+        boolean found = false;
+        while (cursor.moveToNext()) {
+            if (calId == cursor.getInt(0)) {
+                found = true;
+                break;
+            }
+        }
+        cursor.close();
+        return found;
+    }
+
+    public void testDeleteAllCalendars() {
+        checkCalendarCount(0);
+
+        insertCal("Calendar1", "America/Los_Angeles");
+        insertCal("Calendar2", "America/Los_Angeles");
+
+        checkCalendarCount(2);
+
+        deleteMatchingCalendars(null /* selection */, null /* selectionArgs*/);
+        checkCalendarCount(0);
+    }
+
+    public void testDeleteCalendarsWithSelection() {
+        checkCalendarCount(0);
+
+        int calId1 = insertCal("Calendar1", "America/Los_Angeles");
+        int calId2 = insertCal("Calendar2", "America/Los_Angeles");
+
+        checkCalendarCount(2);
+        checkCalendarExists(calId1);
+        checkCalendarExists(calId2);
+
+        deleteMatchingCalendars(Calendars._ID + "=" + calId2, null /* selectionArgs*/);
+        checkCalendarCount(1);
+        checkCalendarExists(calId1);
+        checkCalendarDoesNotExists(calId2);
+    }
+
+    public void testDeleteCalendarsWithSelectionAndArgs() {
+        checkCalendarCount(0);
+
+        int calId1 = insertCal("Calendar1", "America/Los_Angeles");
+        int calId2 = insertCal("Calendar2", "America/Los_Angeles");
+
+        checkCalendarCount(2);
+        checkCalendarExists(calId1);
+        checkCalendarExists(calId2);
+
+        deleteMatchingCalendars(Calendars._ID + "=?",
+                new String[] { Integer.toString(calId2) });
+        checkCalendarCount(1);
+        checkCalendarExists(calId1);
+        checkCalendarDoesNotExists(calId2);
+
+        deleteMatchingCalendars(Calendars._ID + "=?" + " AND " + Calendars.NAME + "=?",
+                new String[] { Integer.toString(calId1), "Calendar1" });
+        checkCalendarCount(0);
     }
 }

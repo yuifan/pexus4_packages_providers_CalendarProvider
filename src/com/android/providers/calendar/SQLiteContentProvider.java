@@ -26,6 +26,7 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.database.sqlite.SQLiteTransactionListener;
 import android.net.Uri;
+import android.provider.CalendarContract;
 
 import java.util.ArrayList;
 
@@ -44,6 +45,8 @@ public abstract class SQLiteContentProvider extends ContentProvider
     private final ThreadLocal<Boolean> mApplyingBatch = new ThreadLocal<Boolean>();
     private static final int SLEEP_AFTER_YIELD_DELAY = 4000;
 
+    private Boolean mIsCallerSyncAdapter;
+
     @Override
     public boolean onCreate() {
         Context context = getContext();
@@ -56,20 +59,22 @@ public abstract class SQLiteContentProvider extends ContentProvider
     /**
      * The equivalent of the {@link #insert} method, but invoked within a transaction.
      */
-    protected abstract Uri insertInTransaction(Uri uri, ContentValues values);
+    protected abstract Uri insertInTransaction(Uri uri, ContentValues values,
+            boolean callerIsSyncAdapter);
 
     /**
      * The equivalent of the {@link #update} method, but invoked within a transaction.
      */
     protected abstract int updateInTransaction(Uri uri, ContentValues values, String selection,
-            String[] selectionArgs);
+            String[] selectionArgs, boolean callerIsSyncAdapter);
 
     /**
      * The equivalent of the {@link #delete} method, but invoked within a transaction.
      */
-    protected abstract int deleteInTransaction(Uri uri, String selection, String[] selectionArgs);
+    protected abstract int deleteInTransaction(Uri uri, String selection, String[] selectionArgs,
+            boolean callerIsSyncAdapter);
 
-    protected abstract void notifyChange();
+    protected abstract void notifyChange(boolean syncToNetwork);
 
     protected SQLiteOpenHelper getDatabaseHelper() {
         return mOpenHelper;
@@ -83,11 +88,12 @@ public abstract class SQLiteContentProvider extends ContentProvider
     public Uri insert(Uri uri, ContentValues values) {
         Uri result = null;
         boolean applyingBatch = applyingBatch();
+        boolean isCallerSyncAdapter = getIsCallerSyncAdapter(uri);
         if (!applyingBatch) {
             mDb = mOpenHelper.getWritableDatabase();
             mDb.beginTransactionWithListener(this);
             try {
-                result = insertInTransaction(uri, values);
+                result = insertInTransaction(uri, values, isCallerSyncAdapter);
                 if (result != null) {
                     mNotifyChange = true;
                 }
@@ -96,9 +102,9 @@ public abstract class SQLiteContentProvider extends ContentProvider
                 mDb.endTransaction();
             }
 
-            onEndTransaction();
+            onEndTransaction(isCallerSyncAdapter);
         } else {
-            result = insertInTransaction(uri, values);
+            result = insertInTransaction(uri, values, isCallerSyncAdapter);
             if (result != null) {
                 mNotifyChange = true;
             }
@@ -109,11 +115,12 @@ public abstract class SQLiteContentProvider extends ContentProvider
     @Override
     public int bulkInsert(Uri uri, ContentValues[] values) {
         int numValues = values.length;
+        boolean isCallerSyncAdapter = getIsCallerSyncAdapter(uri);
         mDb = mOpenHelper.getWritableDatabase();
         mDb.beginTransactionWithListener(this);
         try {
             for (int i = 0; i < numValues; i++) {
-                Uri result = insertInTransaction(uri, values[i]);
+                Uri result = insertInTransaction(uri, values[i], isCallerSyncAdapter);
                 if (result != null) {
                     mNotifyChange = true;
                 }
@@ -124,7 +131,7 @@ public abstract class SQLiteContentProvider extends ContentProvider
             mDb.endTransaction();
         }
 
-        onEndTransaction();
+        onEndTransaction(isCallerSyncAdapter);
         return numValues;
     }
 
@@ -132,11 +139,13 @@ public abstract class SQLiteContentProvider extends ContentProvider
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
         int count = 0;
         boolean applyingBatch = applyingBatch();
+        boolean isCallerSyncAdapter = getIsCallerSyncAdapter(uri);
         if (!applyingBatch) {
             mDb = mOpenHelper.getWritableDatabase();
             mDb.beginTransactionWithListener(this);
             try {
-                count = updateInTransaction(uri, values, selection, selectionArgs);
+                count = updateInTransaction(uri, values, selection, selectionArgs,
+                            isCallerSyncAdapter);
                 if (count > 0) {
                     mNotifyChange = true;
                 }
@@ -145,9 +154,10 @@ public abstract class SQLiteContentProvider extends ContentProvider
                 mDb.endTransaction();
             }
 
-            onEndTransaction();
+            onEndTransaction(isCallerSyncAdapter);
         } else {
-            count = updateInTransaction(uri, values, selection, selectionArgs);
+            count = updateInTransaction(uri, values, selection, selectionArgs,
+                        isCallerSyncAdapter);
             if (count > 0) {
                 mNotifyChange = true;
             }
@@ -160,11 +170,12 @@ public abstract class SQLiteContentProvider extends ContentProvider
     public int delete(Uri uri, String selection, String[] selectionArgs) {
         int count = 0;
         boolean applyingBatch = applyingBatch();
+        boolean isCallerSyncAdapter = getIsCallerSyncAdapter(uri);
         if (!applyingBatch) {
             mDb = mOpenHelper.getWritableDatabase();
             mDb.beginTransactionWithListener(this);
             try {
-                count = deleteInTransaction(uri, selection, selectionArgs);
+                count = deleteInTransaction(uri, selection, selectionArgs, isCallerSyncAdapter);
                 if (count > 0) {
                     mNotifyChange = true;
                 }
@@ -173,9 +184,9 @@ public abstract class SQLiteContentProvider extends ContentProvider
                 mDb.endTransaction();
             }
 
-            onEndTransaction();
+            onEndTransaction(isCallerSyncAdapter);
         } else {
-            count = deleteInTransaction(uri, selection, selectionArgs);
+            count = deleteInTransaction(uri, selection, selectionArgs, isCallerSyncAdapter);
             if (count > 0) {
                 mNotifyChange = true;
             }
@@ -183,14 +194,27 @@ public abstract class SQLiteContentProvider extends ContentProvider
         return count;
     }
 
+    protected boolean getIsCallerSyncAdapter(Uri uri) {
+        boolean isCurrentSyncAdapter = QueryParameterUtils.readBooleanQueryParameter(uri,
+                CalendarContract.CALLER_IS_SYNCADAPTER, false);
+        if (mIsCallerSyncAdapter == null || mIsCallerSyncAdapter) {
+            mIsCallerSyncAdapter = isCurrentSyncAdapter;
+        }
+        return isCurrentSyncAdapter;
+    }
+
     @Override
     public ContentProviderResult[] applyBatch(ArrayList<ContentProviderOperation> operations)
             throws OperationApplicationException {
+        final int numOperations = operations.size();
+        if (numOperations == 0) {
+            return new ContentProviderResult[0];
+        }
         mDb = mOpenHelper.getWritableDatabase();
         mDb.beginTransactionWithListener(this);
+        final boolean isCallerSyncAdapter = getIsCallerSyncAdapter(operations.get(0).getUri());
         try {
             mApplyingBatch.set(true);
-            final int numOperations = operations.size();
             final ContentProviderResult[] results = new ContentProviderResult[numOperations];
             for (int i = 0; i < numOperations; i++) {
                 final ContentProviderOperation operation = operations.get(i);
@@ -204,11 +228,12 @@ public abstract class SQLiteContentProvider extends ContentProvider
         } finally {
             mApplyingBatch.set(false);
             mDb.endTransaction();
-            onEndTransaction();
+            onEndTransaction(isCallerSyncAdapter);
         }
     }
 
     public void onBegin() {
+        mIsCallerSyncAdapter = null;
         onBeginTransaction();
     }
 
@@ -226,10 +251,11 @@ public abstract class SQLiteContentProvider extends ContentProvider
     protected void beforeTransactionCommit() {
     }
 
-    protected void onEndTransaction() {
+    protected void onEndTransaction(boolean isCallerSyncAdapter) {
         if (mNotifyChange) {
             mNotifyChange = false;
-            notifyChange();
+            // We sync to network if the caller was not the sync adapter
+            notifyChange(!isCallerSyncAdapter);
         }
     }
 }

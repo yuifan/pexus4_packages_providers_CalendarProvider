@@ -33,6 +33,7 @@
     <uses-permission android:name="android.permission.SUBSCRIBED_FEEDS_READ" />
     <uses-permission android:name="android.permission.SUBSCRIBED_FEEDS_WRITE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <application android:label="@string/calendar_storage"
                  android:icon="@drawable/app_icon">
@@ -43,14 +44,19 @@
         <provider android:name="CalendarProvider2" android:authorities="com.android.calendar"
                 android:label="@string/provider_label"
                 android:multiprocess="false"
+                android:exported="true"
                 android:readPermission="android.permission.READ_CALENDAR"
                 android:writePermission="android.permission.WRITE_CALENDAR" />
 
         <!-- This is used to keep the provider alive long enough to send update
-            intent broadcasts. -->
+             intent broadcasts. -->
         <service android:name=".EmptyService" />
+        <!-- This is used to keep the provider alive long enough to clean up scheduled
+             alarms after boot. -->
+        <service android:name=".CalendarReceiver$RemoveScheduledAlarmsEmptyService" />
 
-        <activity android:name="CalendarContentProviderTests" android:label="Calendar Content Provider">
+        <activity android:name="CalendarContentProviderTests" android:label="Calendar Content Provider"
+                android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.UNIT_TEST" />
@@ -61,22 +67,15 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
-        <receiver android:name=".CalendarAppWidgetProvider" android:label="@string/gadget_title">
-            <intent-filter>
-                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-                <action android:name="com.android.calendar.APPWIDGET_UPDATE" />
-            </intent-filter>
-            <meta-data android:name="android.appwidget.provider" android:resource="@xml/appwidget_info" />
-        </receiver>
-        <receiver android:name=".TimeChangeReceiver" android:enabled="false">
-            <intent-filter>
-                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
-                <action android:name="android.intent.action.TIME_SET" />
-                <action android:name="android.intent.action.DATE_CHANGED" />
-            </intent-filter>
-        </receiver>
-        <service android:name=".CalendarAppWidgetService" />
+
         <activity android:name="CalendarDebug" android:label="@string/calendar_info">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <activity android:name="CalendarDebugActivity" android:label="@string/calendar_info"
+                android:theme="@android:style/Theme.Holo.Dialog">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -98,6 +97,14 @@
                <action android:name="android.intent.action.PRE_BOOT_COMPLETED"/>
            </intent-filter>
        </receiver>
+
+        <receiver android:name="CalendarProviderBroadcastReceiver">
+            <intent-filter>
+                <action android:name="com.android.providers.calendar.intent.CalendarProvider2" />
+                <category android:name="com.android.providers.calendar"/>
+            </intent-filter>
+        </receiver>
+        <service android:name="CalendarProviderIntentService"/>
 
     </application>
 </manifest>
